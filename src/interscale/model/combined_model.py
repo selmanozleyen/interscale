@@ -16,10 +16,12 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
     def __init__(
         self,
-        adata: AnnData,
+        adata: AnnData | None,
         cfg: CN,
+        *,
+        registry: dict | None = None,
     ):
-        super().__init__(adata, cfg)
+        super().__init__(adata, cfg, registry=registry)
 
         self._module_kwargs = self._cfg.model
 

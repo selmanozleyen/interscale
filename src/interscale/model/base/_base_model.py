@@ -86,8 +86,10 @@ class BaseModel(metaclass=BaseModelMeta):
 
     def __init__(
         self,
-        adata: AnnData,
+        adata: AnnData | None,
         cfg: CN,
+        *,
+        registry: dict | None = None,
     ):
         self.id = str(uuid4())  # Used for cls._manager_store keys.
         self._cfg = cfg
@@ -101,11 +103,22 @@ class BaseModel(metaclass=BaseModelMeta):
 
         # scvi-tools like data handling
         self._adata = adata
-        self._adata_manager = self._get_most_recent_anndata_manager(adata, required=True)
-        self._register_manager_for_instance(self._adata_manager)
-        # Suffix registry instance variable with _ to include it when saving the model.
-        self.registry_ = self._adata_manager.registry
-        self.summary_stats = self._adata_manager.summary_stats
+        if adata is None:
+            # As scvi-tools' custom dataloaders do (`SCVI(adata=None, registry=datamodule.registry)`): the
+            # datamodule describes the data from its metadata, so the expression matrix is never loaded.
+            if registry is None:
+                raise ValueError("Pass `adata`, or `adata=None` with a datamodule's `registry`.")
+            if self.prediction_task == "classification":
+                raise NotImplementedError("Training from a datamodule registry covers regression only.")
+            self._adata_manager = None
+            self.registry_ = registry
+            self.summary_stats = registry["summary_stats"]
+        else:
+            self._adata_manager = self._get_most_recent_anndata_manager(adata, required=True)
+            self._register_manager_for_instance(self._adata_manager)
+            # Suffix registry instance variable with _ to include it when saving the model.
+            self.registry_ = self._adata_manager.registry
+            self.summary_stats = self._adata_manager.summary_stats
         # TODO: check that anndata is set up in coherence with the cfg file
 
         self.n_input = self.summary_stats["n_x"]

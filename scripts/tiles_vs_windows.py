@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import squidpy as sq
 import yaml
@@ -75,17 +76,25 @@ def config(args, h5ad: str):
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pipeline", choices=["windows", "tiles"], required=True)
+    p.add_argument("--pipeline", choices=["windows", "tiles", "tiles-backed"], default="tiles")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--cache", default=None, help="where legnini() caches its .h5ad")
-    p.add_argument("--out", required=True)
+    p.add_argument("--zarr", default=None, help="tiles-backed: the zarr store (written by --write-zarr)")
+    p.add_argument("--write-zarr", action="store_true", help="write --zarr from Legnini and exit")
+    p.add_argument("--out", default=None)
     args = p.parse_args()
 
-    adata = legnini(args.cache)
+    if args.write_zarr:
+        write_zarr(args)
+        return
     cfg = config(args, h5ad=str(args.cache or ""))
     set_full_reproducibility(cfg.optim.seed)
+    if args.pipeline == "tiles-backed":
+        return run(args, cfg, *backed(args, cfg))
+
+    adata = legnini(args.cache)
     sizes = adata.obs["sample"].value_counts()
     print(f"{adata.n_obs} cells, {adata.n_vars} genes, {sizes.size} samples ({sizes.min()}-{sizes.max()} cells)")
 
@@ -112,10 +121,46 @@ def main() -> None:
     else:
         sq.gr.spatial_neighbors(adata, coord_type="generic", radius=RADIUS, library_key="sample")
         dm = TileDataModule(adata, cfg, graph=adata.obsp["spatial_connectivities"])
+    run(args, cfg, model, dm, time.perf_counter() - t0)
+
+
+def write_zarr(args) -> None:
+    """Legnini's layer, coordinates, sample and split, rows sorted by sample and then along a Z-order curve."""
+    import anndata as ad
+    from geome.tiles import morton_order
+
+    adata = legnini(args.cache)
+    rank = np.empty(adata.n_obs, dtype=np.int64)
+    rank[morton_order(adata.obsm["spatial"])] = np.arange(adata.n_obs)
+    order = np.lexsort((rank, pd.factorize(adata.obs["sample"])[0]))
+    slim = ad.AnnData(
+        obs=adata.obs[["sample", "split"]].astype("category"),
+        var=adata.var[[]],
+        layers={"log1p_norm": adata.layers["log1p_norm"]},
+        obsm={"spatial": adata.obsm["spatial"]},
+    )[order].copy()
+    slim.write_zarr(args.zarr)
+    print(f"wrote {args.zarr}: {slim.n_obs} cells x {slim.n_vars} genes")
+
+
+def backed(args, cfg):
+    """Model and datamodule from the zarr store: expression stays on disk, the model is built from shapes."""
+    import anndata as ad
+    import zarr
+
+    t0 = time.perf_counter()
+    g = zarr.open_group(args.zarr, mode="r")  # only obs and coordinates, for the radius graph
+    light = ad.AnnData(obs=ad.io.read_elem(g["obs"])[["sample"]], obsm={"spatial": np.asarray(g["obsm/spatial"][:])})
+    sq.gr.spatial_neighbors(light, coord_type="generic", radius=RADIUS, library_key="sample")
+    dm = TileDataModule.from_path(args.zarr, cfg, graph=light.obsp["spatial_connectivities"])
+    model = interscale.model.CombinedModel(None, cfg=cfg, registry=dm.registry)
+    return model, dm, time.perf_counter() - t0
+
+
+def run(args, cfg, model, dm, prep_s) -> None:
+    if isinstance(dm, TileDataModule):
         n = [t.size for t in dm.loader.tiles]
         print(f"{len(n)} tiles ({min(n)}-{max(n)} core cells), margin of {dm.loader.n_hops} hops")
-    prep_s = time.perf_counter() - t0
-
     t0 = time.perf_counter()
     model.train(max_epochs=args.epochs, datamodule=dm, early_stopping=False, wandb_use=False)
     train_s = time.perf_counter() - t0

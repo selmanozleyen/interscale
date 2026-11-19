@@ -102,6 +102,22 @@ class TileDataModule(pl.LightningDataModule):
         self.learning_type = "node"
         self.setup_called = False
 
+    @classmethod
+    def from_path(cls, path, cfg: CN, **kwargs) -> TileDataModule:
+        """Open a zarr store backed with :func:`scfit.data.open_adata`, reading only what the tiles need."""
+        from anndata.acc import A
+        from scfit.data import open_adata
+
+        rep = A.layers[cfg.dataset.layer_key] if cfg.dataset.layer_key else A.X
+        cols = [*(A.obs[k] for k in cfg.dataset.sample_key), A.obs[cfg.dataset.split_key]]
+        return cls(open_adata(path, rep, A.obsm["spatial"], *cols), cfg, **kwargs)
+
+    @property
+    def registry(self) -> dict:
+        """What the model needs to know about the data, from shapes alone: pass as ``Model(None, cfg, registry=)``."""
+        n_obs, n_vars = self.loader.n_obs, self.loader.n_vars
+        return {"setup_method_name": "TileDataModule", "summary_stats": {"n_x": n_vars, "n_cells": n_obs}}
+
     def setup(self, stage: str | None = None) -> None:
         self.setup_called = True
 
