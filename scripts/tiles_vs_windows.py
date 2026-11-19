@@ -66,7 +66,7 @@ def config(args, h5ad: str):
             "batch_size": args.batch_size,
             "spatial_neigbors_kwargs": {"radius": RADIUS},
         },
-        "optim": {"n_epochs": args.epochs, "early_stopping": False, "seed": args.seed},
+        "optim": {"n_epochs": args.epochs, "early_stopping": args.early_stopping, "seed": args.seed},
         "wandb": {"use": False},
     }
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
@@ -78,6 +78,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pipeline", choices=["windows", "tiles", "tiles-backed"], default="tiles")
     p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--early-stopping", action="store_true", help="InterScale's own (patience, min_epochs)")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--cache", default=None, help="where legnini() caches its .h5ad")
@@ -162,7 +163,7 @@ def run(args, cfg, model, dm, prep_s) -> None:
         n = [t.size for t in dm.loader.tiles]
         print(f"{len(n)} tiles ({min(n)}-{max(n)} core cells), margin of {dm.loader.n_hops} hops")
     t0 = time.perf_counter()
-    model.train(max_epochs=args.epochs, datamodule=dm, early_stopping=False, wandb_use=False)
+    model.train(max_epochs=args.epochs, datamodule=dm, early_stopping=args.early_stopping, wandb_use=False)
     train_s = time.perf_counter() - t0
 
     history = [
@@ -172,6 +173,8 @@ def run(args, cfg, model, dm, prep_s) -> None:
     result = {
         "pipeline": args.pipeline,
         "epochs": args.epochs,
+        "seed": args.seed,
+        "epochs_run": len(history),
         "prep_seconds": prep_s,
         "train_seconds": train_s,
         "peak_rss_gb": peak_rss_gb(),
