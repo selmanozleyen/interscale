@@ -4,6 +4,7 @@ import torch
 from yacs.config import CfgNode as CN
 
 from interscale.module.base import BaseModule, GlobalModule, LocalModule
+from interscale.tiles_datamodule import drop_halo
 
 
 class CombinedModule(BaseModule):
@@ -52,6 +53,9 @@ class CombinedModule(BaseModule):
         local_input = getattr(batch_masked, "embeddings", batch_masked.x)
 
         local_embedding = self.local_module.forward(local_input, batch_masked.edge_index)
+        if getattr(batch_masked, "core_mask", None) is not None:  # geome tiles: the margin only feeds the GNN
+            local_embedding = local_embedding[batch_masked.core_mask]
+            batch_masked = drop_halo(batch_masked)
 
         padded_emb, src_padding_mask, pad_index_nodes, attention_mask = self.global_module.common_step_local_to_global(
             batch_masked, local_embedding
@@ -77,6 +81,7 @@ class CombinedModule(BaseModule):
             self.forward(batch_masked)
         )
         y_pred = self.predict_global(global_embedding, src_padding_mask, prediction_level)
+        batch = drop_halo(batch)  # truth and masks for the core cells the transformer saw
 
         if prediction_task == "classification" and prediction_level == "graph":
             y_true = batch.y[batch.ptr[:-1]]
