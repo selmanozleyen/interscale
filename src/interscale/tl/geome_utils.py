@@ -184,6 +184,7 @@ def prepare_geome_dataset(adata, cfg: CN, lazy: bool = False):
             datas_train = LazyCategoryData(adata, a2d, rows=split == "train")
             datas_val = LazyCategoryData(adata, a2d, rows=split == "val")
             datas_test = LazyCategoryData(adata, a2d, rows=split == "test")
+            _ = None  # the eager path returns a2d's extra results here; the lazy one has none
             continue
         pyg_train, _ = list(a2d(adata[adata.obs[split_key] == "train"]))
         pyg_val, _ = list(a2d(adata[adata.obs[split_key] == "val"]))
