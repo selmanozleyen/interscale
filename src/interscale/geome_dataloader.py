@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Literal
 
 import lightning.pytorch as pl
@@ -208,3 +209,55 @@ class GraphAnnDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             **kwargs,
         )
+
+
+class _MaskedWindows(torch.utils.data.Dataset):
+    """Lazy windows with their masks kept here, so a window read in a worker carries this epoch's mask."""
+
+    def __init__(self, windows) -> None:
+        self.windows = windows
+        self.masks: list[dict[str, torch.Tensor]] = [{} for _ in range(len(windows))]
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, i: int) -> Data:
+        data = self.windows[i]
+        for key, value in self.masks[i].items():
+            setattr(data, key, value)
+        return data
+
+
+class LazyGraphAnnDataModule(GraphAnnDataModule):
+    """:class:`GraphAnnDataModule` over :class:`geome.ann2data.LazyCategoryData` from ``prepare_geome_dataset(lazy=True)``.
+
+    Windows are read from the (backed) data when batched and dropped after. Masks are small, so they stay in memory and
+    are drawn with the same calls, in the same order and shapes, as the eager module: under the same seed a run
+    matches the eager one step for step.
+    """
+
+    def _draw(self, windows: _MaskedWindows, mask: bool) -> None:
+        n_vars = windows.windows.n_vars
+        for i in range(len(windows)):
+            n = windows.windows.num_nodes(i)
+            # what _assign_random_mask reads of a Data: its node count, and x's width under gene masking
+            stub = SimpleNamespace(num_nodes=n, x=SimpleNamespace(shape=(n, n_vars)))
+            if mask:
+                self._assign_random_mask(stub)
+            else:
+                stub.mask = torch.zeros(n, dtype=torch.bool)
+            windows.masks[i] = {k: getattr(stub, k) for k in ("mask", "gene_mask") if hasattr(stub, k)}
+
+    def _spatial_node_loader(self, data_list, shuffle: bool = False, mask: bool = True, **kwargs) -> DataLoader:
+        windows = _MaskedWindows(data_list)
+        self._draw(windows, mask)
+        if data_list is self.train_data:
+            self._train_windows = windows
+        return DataLoader(
+            dataset=windows, shuffle=shuffle, batch_size=self.batch_size, num_workers=self.num_workers, **kwargs
+        )
+
+    def resample_train_mask(self) -> None:
+        """Redraw the training masks, as the eager module does each epoch."""
+        if self.setup_called:
+            self._draw(self._train_windows, mask=True)

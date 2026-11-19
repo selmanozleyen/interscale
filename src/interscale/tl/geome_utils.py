@@ -1,5 +1,6 @@
 import numpy as np
 from geome import ann2data, iterables, transforms
+from geome.ann2data import LazyCategoryData
 from yacs.config import CfgNode as CN
 
 
@@ -68,9 +69,14 @@ def prepare_a2d_dataset(cfg: CN):
         )
 
 
-def prepare_geome_dataset(adata, cfg: CN):
+def prepare_geome_dataset(adata, cfg: CN, lazy: bool = False):
     """
     Loads, preprocesses and transforms the defined .h5ad data to a list of PyG data according to cfg file.
+
+    With ``lazy=True`` each split is a :class:`geome.ann2data.LazyCategoryData` instead: the same graphs, built and
+    read one window at a time, so ``adata`` can be backed (``read_h5ad(..., backed="r")``) and stay on disk. Its
+    ``obs_names`` are kept as they are (they must already be "1".."n"), so they keep naming the original cells in a
+    store reordered by window.
     """
     assert ("classification" in (cfg.dataset.prediction_task)) or ("regression" in (cfg.dataset.prediction_task))
     if "classification" in cfg.dataset.prediction_task:
@@ -80,9 +86,10 @@ def prepare_geome_dataset(adata, cfg: CN):
     assert all(item in adata.obs for item in cfg.dataset.sample_key), "Not all library_keys are in adata.obs_names"
 
     # Check for duplicate observation names
-    adata.obs_names = [
-        str(i) for i in range(1, len(adata.obs_names) + 1)
-    ]  # ensure that no duplicate observation names are present
+    if not lazy:
+        adata.obs_names = [
+            str(i) for i in range(1, len(adata.obs_names) + 1)
+        ]  # ensure that no duplicate observation names are present
     assert len(adata.obs_names) == len(adata.obs_names.unique()), (
         f"Duplicate observation names found. Expected {len(adata.obs_names)} unique names but found {len(adata.obs_names.unique())}"
     )
@@ -168,6 +175,16 @@ def prepare_geome_dataset(adata, cfg: CN):
             save_preprocessed_adata=True,
         )
 
+        if lazy:
+            # ponytail: one LazyCategoryData per split for the first sample_key; several keys would need a
+            # ConcatDataset, add it when a lazy run iterates more than one.
+            if len(category_to_iterate_list) > 1:
+                raise NotImplementedError("lazy=True iterates one sample_key.")
+            split = adata.obs[split_key].to_numpy()
+            datas_train = LazyCategoryData(adata, a2d, rows=split == "train")
+            datas_val = LazyCategoryData(adata, a2d, rows=split == "val")
+            datas_test = LazyCategoryData(adata, a2d, rows=split == "test")
+            continue
         pyg_train, _ = list(a2d(adata[adata.obs[split_key] == "train"]))
         pyg_val, _ = list(a2d(adata[adata.obs[split_key] == "val"]))
         datas_train.extend(pyg_train)

@@ -58,7 +58,7 @@ def config(args, h5ad: str):
         "dataset": {
             "h5ad_data": h5ad,
             "name": f"legnini_{args.pipeline}",
-            "layer_key": "log1p_norm",
+            "layer_key": None if args.pipeline == "windows-lazy" else "log1p_norm",  # the lazy store keeps it in X
             "sample_key": ["sample"],
             "split_key": "split",
             "prediction_task": "regression",
@@ -76,7 +76,7 @@ def config(args, h5ad: str):
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pipeline", choices=["windows", "tiles", "tiles-backed"], default="tiles")
+    p.add_argument("--pipeline", choices=["windows", "windows-lazy", "tiles", "tiles-backed"], default="tiles")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--early-stopping", action="store_true", help="InterScale's own (patience, min_epochs)")
     p.add_argument("--batch-size", type=int, default=8)
@@ -84,16 +84,24 @@ def main() -> None:
     p.add_argument("--cache", default=None, help="where legnini() caches its .h5ad")
     p.add_argument("--zarr", default=None, help="tiles-backed: the zarr store (written by --write-zarr)")
     p.add_argument("--write-zarr", action="store_true", help="write --zarr from Legnini and exit")
+    p.add_argument("--h5ad", default=None, help="windows-lazy: the store (written by --write-h5ad)")
+    p.add_argument("--write-h5ad", action="store_true", help="write --h5ad from Legnini and exit")
+    p.add_argument("--num-workers", type=int, default=1, help="dataloader workers of the window pipelines")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
     if args.write_zarr:
         write_zarr(args)
         return
+    if args.write_h5ad:
+        write_h5ad(args)
+        return
     cfg = config(args, h5ad=str(args.cache or ""))
     set_full_reproducibility(cfg.optim.seed)
     if args.pipeline == "tiles-backed":
         return run(args, cfg, *backed(args, cfg))
+    if args.pipeline == "windows-lazy":
+        return run(args, cfg, *lazy_windows(args, cfg))
 
     adata = legnini(args.cache)
     sizes = adata.obs["sample"].value_counts()
@@ -113,7 +121,7 @@ def main() -> None:
         datas, _ = prepare_geome_dataset(adata, cfg)
         dm = GraphAnnDataModule(
             datas=datas,
-            num_workers=1,
+            num_workers=args.num_workers,
             batch_size=args.batch_size,
             mask_percentage=cfg.dataset.mask_percentage,
             mask_strategy=cfg.dataset.mask_strategy,
@@ -142,6 +150,52 @@ def write_zarr(args) -> None:
     )[order].copy()
     slim.write_zarr(args.zarr)
     print(f"wrote {args.zarr}: {slim.n_obs} cells x {slim.n_vars} genes")
+
+
+def write_h5ad(args) -> None:
+    """Legnini as ``windows-lazy`` reads it: the layer as X, rows stably sorted by sample, original names kept.
+
+    Backed h5ad keeps only X on disk, hence the layer in X. Each sample is one contiguous run of rows, and within it
+    the cells keep their original order, so every window equals the eager one; ``obs_names`` "1".."n" still name the
+    cells in their original order, for mapping results back.
+    """
+    import anndata as ad
+
+    adata = legnini(args.cache)
+    sample = adata.obs["sample"].astype("category")
+    store = ad.AnnData(
+        X=adata.layers["log1p_norm"],
+        obs={"sample": sample.to_numpy(), "split": adata.obs["split"].to_numpy()},
+        var=adata.var[[]],
+        obsm={"spatial": adata.obsm["spatial"]},
+    )
+    store.obs["sample"] = store.obs["sample"].astype(pd.CategoricalDtype(sample.cat.categories))
+    store.obs["split"] = store.obs["split"].astype("category")
+    store.obs_names = [str(i) for i in range(1, store.n_obs + 1)]  # as prepare_geome_dataset names them
+    order = np.argsort(sample.cat.codes.to_numpy(), kind="stable")
+    store[order].copy().write_h5ad(args.h5ad)
+    print(f"wrote {args.h5ad}: {store.n_obs} cells x {store.n_vars} genes, sorted by sample")
+
+
+def lazy_windows(args, cfg):
+    """InterScale's own windows, read one at a time from the backed store; the model is built from shapes."""
+    import anndata as ad
+
+    from interscale.geome_dataloader import LazyGraphAnnDataModule
+
+    t0 = time.perf_counter()
+    adata = ad.read_h5ad(args.h5ad, backed="r")  # obs and obsm in memory, X on disk
+    model = interscale.model.CombinedModel(None, cfg=cfg, registry={"summary_stats": {"n_x": adata.n_vars}})
+    datas, _ = prepare_geome_dataset(adata, cfg, lazy=True)
+    dm = LazyGraphAnnDataModule(
+        datas=datas,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size,
+        mask_percentage=cfg.dataset.mask_percentage,
+        mask_strategy=cfg.dataset.mask_strategy,
+        learning_type="node",
+    )
+    return model, dm, time.perf_counter() - t0
 
 
 def backed(args, cfg):
