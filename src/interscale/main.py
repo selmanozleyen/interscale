@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=r".*spatial_ne
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*n_neighs.*")
 
 
-def build_run(cfg, model_type: str, num_workers: int = 1):
+def build_run(cfg, model_type: str, num_workers: int = 0):
     """The model and datamodule of a training run: what ``main`` and ``main_sweep`` train."""
     set_full_reproducibility(cfg.optim.seed)  # graph construction may draw (segmentation noise)
     datasets = load_graph_datasets(cfg)
@@ -24,7 +24,7 @@ def build_run(cfg, model_type: str, num_workers: int = 1):
     return model, GraphAnnDataModule.from_cfg(datasets, cfg, num_workers=num_workers)
 
 
-def main(cfg, model_type, num_workers: int = 1):
+def main(cfg, model_type, num_workers: int = 0):
     """Train a single model.
 
     Parameters
@@ -71,8 +71,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=None,
-        help="DataLoader worker processes (default 1, or 0 with --zarrs). 0 prefetches on a thread instead.",
+        default=0,
+        help="DataLoader worker processes (default 0: batches load on a prefetch thread, which measured faster "
+        "than worker processes because those are re-forked every epoch).",
     )
     parser.add_argument(
         "--zarrs",
@@ -90,8 +91,6 @@ if __name__ == "__main__":
     if args.model_type is None:
         parser.error("--model_type is required (LocalModel, GlobalModel or CombinedModel).")
 
-    if args.num_workers is None:
-        args.num_workers = 0 if args.zarrs else 1
     if args.zarrs:
         if args.num_workers:
             parser.error("--zarrs needs --num_workers 0 (zarrs deadlocks in forked workers, zarrs-python#171).")

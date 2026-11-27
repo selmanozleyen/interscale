@@ -72,7 +72,8 @@ class GraphAnnDataModule(pl.LightningDataModule):
     batch_size
         Graphs per batch.
     num_workers
-        DataLoader worker processes, re-created every epoch (see ``MaskedGraphDataset``).
+        DataLoader worker processes, re-created every epoch (see ``MaskedGraphDataset``). 0, the
+        default, loads batches on a prefetch thread instead, which measured faster on both paths.
     mask_percentage, mask_strategy, seed
         Passed to :class:`~interscale.data.MaskedGraphDataset`.
     learning_type
@@ -84,7 +85,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         self,
         datas: Sequence[GraphDataset],
         batch_size: int = 1,
-        num_workers: int = 1,
+        num_workers: int = 0,
         mask_percentage: float = 0.5,
         mask_strategy: Literal["node", "gene"] = "node",
         learning_type: Literal["node", "graph"] = "node",
@@ -107,7 +108,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         self.test_masked = None if self.test_data is None else masked(self.test_data, enabled=eval_mask)
 
     @classmethod
-    def from_cfg(cls, datas: Sequence[GraphDataset], cfg: CN, num_workers: int = 1) -> GraphAnnDataModule:
+    def from_cfg(cls, datas: Sequence[GraphDataset], cfg: CN, num_workers: int = 0) -> GraphAnnDataModule:
         """The datamodule a training run with ``cfg`` uses."""
         return cls(
             datas,
