@@ -99,11 +99,8 @@ if __name__ == "__main__":
         zarr.config.set(
             {
                 "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
-                # Keep up to 32 files open per array instead of reopening one per read -- each open is a
-                # metadata round trip on Lustre. Per array, not per process: ~9 arrays x 3 splits x 32
-                # stays under a 1024 ulimit -n. With 65536-row shards, 32 files cover ~2M cells, i.e. a
-                # whole store up to that size; larger ones still reopen shards, just far less often.
-                # Read by zarrs releases after 0.2.3 (zarrs-python#181); older ones ignore it.
+                # per-array open-file LRU: no metadata round trip per shard read on Lustre. 32 x ~27 arrays
+                # stays under ulimit -n 1024. Read by zarrs > 0.2.3 (zarrs-python#181), ignored before.
                 "codec_pipeline.file_handle_cache_size": 32,
             }
         )

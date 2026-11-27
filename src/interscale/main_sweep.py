@@ -68,43 +68,48 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
 
     file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
 
-    print("Wandb initialize...")
-    sweep_run = wandb.init(project=cfg.wandb.project_name, config=cfg, name=file_name_prefix, job_type="model_training")
-    sweep_config = wandb.config
+    if cfg.wandb.use:
+        print("Wandb initialize...")
+        sweep_run = wandb.init(
+            project=cfg.wandb.project_name, config=cfg, name=file_name_prefix, job_type="model_training"
+        )
+        sweep_config = wandb.config
 
-    print("sweep config: ", sweep_config)
-    print("sweep run: ", sweep_run.config)
-    # Applies whatever dotted keys the sweep declares, and raises if any of them does not
-    # exist in the config rather than letting it vary between trials with no effect.
-    cfg, _applied = apply_sweep_config(
-        cfg,
-        sweep_goal,
-        sweep_config,
-        model_type=model_type,
-        sweep_params=sweep_params,
-        arms=arms,
-    )
+    # Update configuration with sweep parameters
+    if sweep_config is not None:
+        print("sweep config: ", sweep_config)
+        print("sweep run: ", sweep_run.config)
+        # Applies whatever dotted keys the sweep declares, and raises if any of them does not
+        # exist in the config rather than letting it vary between trials with no effect.
+        cfg, _applied = apply_sweep_config(
+            cfg,
+            sweep_goal,
+            sweep_config,
+            model_type=model_type,
+            sweep_params=sweep_params,
+            arms=arms,
+        )
 
-    # The name above was derived from the config BEFORE the trial was applied, so every run
-    # of a sweep that varies dataset.name or optim.seed -- both of which feed the prefix, and
-    # through it the checkpoint filename -- appeared under one identical name. Renaming here
-    # makes a run's name the name of the checkpoint it wrote, which is what an analysis
-    # loading models back out of the sweep has to match on.
-    file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
-    if sweep_run.name != file_name_prefix:
-        print(f"renaming run: {sweep_run.name} -> {file_name_prefix}")
-        sweep_run.name = file_name_prefix
-    # Recorded as plain summary keys so the wandb API can be filtered on them without
-    # re-deriving anything from the nested config blob.
-    sweep_run.summary["checkpoint_prefix"] = file_name_prefix
-    sweep_run.summary["resolved_dataset_name"] = cfg.dataset.name
-    sweep_run.summary["resolved_sample_key"] = list(cfg.dataset.sample_key)
-    sweep_run.summary["resolved_seed"] = cfg.optim.seed
-    # `parameters` is only added to the schema for a model type that HAS a global component,
-    # so a LocalModel sweep must not touch it.
-    if global_component:
-        sweep_run.summary["resolved_max_seq_len"] = cfg.model.global_component.parameters.max_seq_len
-    sweep_run.summary["resolved_model_save"] = cfg.model.save
+        # The name above was derived from the config BEFORE the trial was applied, so every run
+        # of a sweep that varies dataset.name or optim.seed -- both of which feed the prefix, and
+        # through it the checkpoint filename -- appeared under one identical name. Renaming here
+        # makes a run's name the name of the checkpoint it wrote, which is what an analysis
+        # loading models back out of the sweep has to match on.
+        file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
+        if sweep_run.name != file_name_prefix:
+            print(f"renaming run: {sweep_run.name} -> {file_name_prefix}")
+            sweep_run.name = file_name_prefix
+        # Recorded as plain summary keys so the wandb API can be filtered on them without
+        # re-deriving anything from the nested config blob.
+        sweep_run.summary["checkpoint_prefix"] = file_name_prefix
+        sweep_run.summary["resolved_dataset_name"] = cfg.dataset.name
+        sweep_run.summary["resolved_sample_key"] = list(cfg.dataset.sample_key)
+        sweep_run.summary["resolved_seed"] = cfg.optim.seed
+        # `parameters` is only added to the schema for a model type that HAS a global component,
+        # so a LocalModel sweep must not touch it.
+        if global_component:
+            sweep_run.summary["resolved_max_seq_len"] = cfg.model.global_component.parameters.max_seq_len
+        sweep_run.summary["resolved_model_save"] = cfg.model.save
 
     model, dm = build_run(cfg, model_type)
     print_memory_usage(f"After building the {model_type} run")

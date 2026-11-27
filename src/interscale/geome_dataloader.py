@@ -5,20 +5,10 @@ from functools import partial
 from typing import Literal
 
 import lightning.pytorch as pl
-from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from yacs.config import CfgNode as CN
 
-from interscale.data import GraphDataset, InMemoryGraphDataset, MaskedGraphDataset
-
-
-def _as_graph_dataset(datas: GraphDataset | Sequence[Data]) -> GraphDataset:
-    """Accept a contract dataset as is, or wrap a bare list of graphs (tests, notebooks)."""
-    if isinstance(datas, GraphDataset):
-        return datas
-    datas = list(datas)
-    n_features = datas[0].x.shape[1] if datas else 0
-    return InMemoryGraphDataset(datas, var_names=[str(i) for i in range(n_features)])
+from interscale.data import GraphDataset, MaskedGraphDataset
 
 
 class GraphAnnDataModule(pl.LightningDataModule):
@@ -27,8 +17,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
     Parameters
     ----------
     datas
-        ``[train, val]`` or ``[train, val, test]``, each a :class:`~interscale.data.GraphDataset`
-        or a plain list of :class:`~torch_geometric.data.Data`.
+        ``[train, val]`` or ``[train, val, test]`` :class:`~interscale.data.GraphDataset` s.
     batch_size
         Graphs per batch.
     num_workers
@@ -42,7 +31,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        datas: Sequence[GraphDataset | Sequence[Data]],
+        datas: Sequence[GraphDataset],
         batch_size: int = 1,
         num_workers: int = 1,
         mask_percentage: float = 0.5,
@@ -58,7 +47,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.train_data, self.val_data, *rest = map(_as_graph_dataset, datas)
+        self.train_data, self.val_data, *rest = datas
         self.test_data = rest[0] if rest else None
         masked = partial(MaskedGraphDataset, mask_strategy=mask_strategy, mask_percentage=mask_percentage, seed=seed)
         eval_mask = learning_type == "node"

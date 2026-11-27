@@ -9,6 +9,7 @@ import torch
 from torch_geometric.data import Data
 
 from interscale.config import load_config
+from interscale.data import InMemoryGraphDataset
 from interscale.geome_dataloader import GraphAnnDataModule
 
 GENES = [f"g{i}" for i in range(6)]
@@ -34,7 +35,8 @@ def make_datamodule(make_graph):
 
     def make(n_features: int = 3, **kwargs) -> GraphAnnDataModule:
         sizes = [[20, 20, 20], [10], [10]]
-        datas = [[make_graph(n, n_features) for n in split] for split in sizes]
+        genes = [str(i) for i in range(n_features)]
+        datas = [InMemoryGraphDataset([make_graph(n, n_features) for n in split], var_names=genes) for split in sizes]
         return GraphAnnDataModule(datas, **{"batch_size": 1, "num_workers": 0, **kwargs})
 
     return make

@@ -9,13 +9,6 @@ def _masks(dataset) -> list[torch.Tensor]:
     return [dataset[i].mask for i in range(len(dataset))]
 
 
-def test_plain_lists_are_wrapped_in_the_contract(make_datamodule):
-    dm = make_datamodule(mask_percentage=0.5)
-
-    assert isinstance(dm.train_data, InMemoryGraphDataset)
-    assert dm.train_data.num_node_features == 3
-
-
 def test_train_mask_is_stable_within_an_epoch_and_changes_across_epochs(make_datamodule):
     dm = make_datamodule(mask_percentage=0.5)
 

@@ -9,27 +9,11 @@ from interscale.tl.geome_utils import prepare_geome_dataset
 
 
 def build_graph_datasets(adata: AnnData, cfg: CN) -> list[InMemoryGraphDataset]:
-    """Build the train/val(/test) contract datasets from an in-memory AnnData.
+    """:func:`~interscale.tl.prepare_geome_dataset`'s splits as contract datasets, ``[train, val(, test)]``.
 
-    Thin wrapper over :func:`interscale.tl.prepare_geome_dataset` that attaches the metadata the
-    models read: ``var_names`` from ``adata.var_names`` and, for classification, ``class_names``
-    from the categories of ``adata.obs[cfg.dataset.prediction_obs]`` -- the column order of the
-    one-hot ``data.y`` geome writes, which :class:`InMemoryGraphDataset` checks graph by graph.
-
-    Like ``prepare_geome_dataset`` it renames ``adata.obs_names`` to ``"1".."N"`` and casts the
-    sample keys to categorical, in place.
-
-    Parameters
-    ----------
-    adata
-        The AnnData to build graphs from; must hold ``cfg.dataset.split_key`` in ``obs``.
-    cfg
-        The run config.
-
-    Returns
-    -------
-    list[InMemoryGraphDataset]
-        ``[train, val]``, or ``[train, val, test]`` when the split has a ``"test"`` category.
+    Adds ``var_names`` and, for classification, ``class_names`` (the one-hot column order). Like
+    ``prepare_geome_dataset``, renames ``obs_names`` to ``"1".."N"`` and casts sample keys to
+    categorical in place.
     """
     class_names = None
     if "classification" in cfg.dataset.prediction_task:
@@ -40,19 +24,8 @@ def build_graph_datasets(adata: AnnData, cfg: CN) -> list[InMemoryGraphDataset]:
 
 
 def load_training_adata(cfg: CN) -> AnnData:
-    """Read ``cfg.dataset.h5ad_data`` into memory, drop cells with no expression and, if
-    ``cfg.dataset.segmentation_robustness`` is ``[node_fraction, overflow_fraction]``, simulate
-    segmentation errors.
-
-    Parameters
-    ----------
-    cfg
-        The run config.
-
-    Returns
-    -------
-    AnnData
-        The preprocessed, in-memory AnnData.
+    """Read ``cfg.dataset.h5ad_data``, drop cells with no expression and apply
+    ``cfg.dataset.segmentation_robustness`` (``[node_fraction, overflow_fraction]``) if set.
     """
     import scanpy as sc
 
@@ -76,23 +49,11 @@ def load_training_adata(cfg: CN) -> AnnData:
 
 
 def load_graph_datasets(cfg: CN) -> list:
-    """The train/val(/test) datasets for a training run.
+    """The ``[train, val(, test)]`` contract datasets of a run.
 
-    With ``cfg.dataset.graph_store`` (a directory) set, the graphs come from
-    :func:`~interscale.data.graph_store_path`, written on first use. The store is built straight
-    from ``h5ad_data`` without loading its expression matrix, except under segmentation noise,
-    which needs the whole AnnData in memory (:func:`load_training_adata`). Without a graph store
-    the graphs are built in memory.
-
-    Parameters
-    ----------
-    cfg
-        The run config.
-
-    Returns
-    -------
-    list
-        Contract datasets, ``[train, val]`` or ``[train, val, test]``.
+    With ``cfg.dataset.graph_store`` set they come from the store at
+    :func:`~interscale.data.graph_store_path`, written on first use straight from ``h5ad_data``
+    (segmentation noise needs the AnnData in memory); otherwise they are built in memory.
     """
     if not cfg.dataset.graph_store:
         return build_graph_datasets(load_training_adata(cfg), cfg)
@@ -102,14 +63,9 @@ def load_graph_datasets(cfg: CN) -> list:
     else:
         print(f"Writing graph store {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        if cfg.dataset.segmentation_robustness is None:
-            write_graph_store(
-                cfg.dataset.h5ad_data,
-                cfg,
-                path,
-                drop_zero_expression=True,
-                shard_rows=cfg.dataset.graph_store_shard_rows,
-            )
-        else:
-            write_graph_store(load_training_adata(cfg), cfg, path, shard_rows=cfg.dataset.graph_store_shard_rows)
+        noise = cfg.dataset.segmentation_robustness is not None  # load_training_adata drops zero cells itself
+        source = load_training_adata(cfg) if noise else cfg.dataset.h5ad_data
+        write_graph_store(
+            source, cfg, path, drop_zero_expression=not noise, shard_rows=cfg.dataset.graph_store_shard_rows
+        )
     return open_graph_store(path, cfg)

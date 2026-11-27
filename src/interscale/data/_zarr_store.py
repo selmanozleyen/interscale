@@ -164,9 +164,7 @@ def _graph_groups(obs, cfg: CN, keep: np.ndarray):
     for key in cfg.dataset.sample_key:
         codes = obs[key].astype("category").cat.codes.to_numpy()
         for split_name in SPLITS:
-            # One stable sort per split, not one pass over every cell per graph: the per-graph
-            # scan was O(cells x graphs), hours at ~50M cells / ~80k windows. Stable keeps each
-            # graph's rows ascending and graphs in code order, as before.
+            # one stable sort per split: rows stay ascending, graphs in code order
             rows = np.flatnonzero(keep & (split == split_name) & (codes >= 0))
             rows = rows[np.argsort(codes[rows], kind="stable")]
             yield from ((split_name, g) for g in np.split(rows, np.flatnonzero(np.diff(codes[rows])) + 1) if len(g))
@@ -269,14 +267,13 @@ def write_graph_store(
         labels = column.cat.codes.to_numpy().astype(np.int32)
 
     keep = src.expressed() if drop_zero_expression else np.ones(len(src.obs), dtype=bool)
+    if shard_rows is not None and shard_rows % chunk_rows:
+        raise ValueError(f"shard_rows ({shard_rows}) must be a multiple of chunk_rows ({chunk_rows}).")
     groups = list(_graph_groups(src.obs, cfg, keep))
     n_genes = len(src.var_names)
 
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
     root = zarr.open_group(tmp, mode="w")
-
-    if shard_rows is not None and shard_rows % chunk_rows:
-        raise ValueError(f"shard_rows ({shard_rows}) must be a multiple of chunk_rows ({chunk_rows}).")
 
     def per_cell(name, width, dtype):
         tail = (width,) if width else ()
@@ -401,7 +398,7 @@ async def _read_runs(array: zarr.Array, runs: list[tuple[int, int]], axis: int) 
 class ZarrGraphDataset(GraphDataset):
     """One split of a zarr graph store, as a contract dataset.
 
-    The zarr group and arrays are opened lazily and dropped on pickling, so each DataLoader worker
+    The zarr arrays are opened lazily and dropped on pickling, so each DataLoader worker
     opens its own handle. :meth:`__getitems__` reads a whole batch with one zarr call per array.
 
     Parameters
@@ -422,8 +419,9 @@ class ZarrGraphDataset(GraphDataset):
     ):
         self.path = Path(path)
         self.split = split
-        self._group = self._arrays = None
-        attrs = self.group.attrs.asdict()
+        self._arrays = None
+        group = zarr.open_group(self.path, mode="r")
+        attrs = group.attrs.asdict()
         if not attrs.get("complete"):
             raise ValueError(f"{self.path} is not a complete graph store.")
         if fingerprint is not None and attrs["fingerprint"] != json.loads(json.dumps(fingerprint)):
@@ -432,27 +430,20 @@ class ZarrGraphDataset(GraphDataset):
                 f"  store:  {attrs['fingerprint']}\n  wanted: {fingerprint}"
             )
         super().__init__(var_names=attrs["var_names"], class_names=attrs["class_names"])
-        self.graph_ids = np.flatnonzero(self.group["split"][:] == SPLITS.index(split))
-        self.node_ptr = self.group["node_ptr"][:]
-        self.edge_ptr = self.group["edge_ptr"][:]
-        self._has_embeddings = "embeddings" in self.group
-
-    @property
-    def group(self) -> zarr.Group:
-        """The store's zarr group, opened read-only on first use in each process."""
-        if self._group is None:
-            self._group = zarr.open_group(self.path, mode="r")
-        return self._group
+        self.graph_ids = np.flatnonzero(group["split"][:] == SPLITS.index(split))
+        self.node_ptr = group["node_ptr"][:]
+        self.edge_ptr = group["edge_ptr"][:]
+        self._has_embeddings = "embeddings" in group
 
     @property
     def arrays(self) -> dict[str, zarr.Array]:
         """The store's arrays, opened once per process (``group[name]`` re-reads the metadata)."""
         if self._arrays is None:
-            self._arrays = dict(self.group.arrays())
+            self._arrays = dict(zarr.open_group(self.path, mode="r").arrays())
         return self._arrays
 
     def __getstate__(self):
-        return {**self.__dict__, "_group": None, "_arrays": None}
+        return {**self.__dict__, "_arrays": None}
 
     @property
     def _cell_keys(self) -> list[str]:
@@ -514,7 +505,7 @@ class ZarrGraphDataset(GraphDataset):
         return data
 
     def _class_counts(self) -> np.ndarray:
-        return self.group["class_counts"][:][self.graph_ids]
+        return self.arrays["class_counts"][:][self.graph_ids]
 
 
 def open_graph_store(path: str | os.PathLike, cfg: CN | None = None) -> list[ZarrGraphDataset]:
