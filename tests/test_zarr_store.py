@@ -1,5 +1,7 @@
 """The zarr graph store is a drop-in, out-of-core implementation of the data contract."""
 
+import sys
+
 import anndata as ad
 import numpy as np
 import pytest
@@ -160,6 +162,31 @@ def test_workers_open_their_own_handle_and_read_the_same_graphs(make_cfg, make_s
 
     for i, batch in enumerate(DataLoader(train, batch_size=1, shuffle=False, num_workers=2)):
         assert torch.equal(batch.x, train[i].x)
+
+
+def test_batched_threaded_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path):
+    from interscale.data import MaskedGraphDataset
+
+    cfg = make_cfg()
+    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train", read_threads=4)
+    idx = list(np.random.default_rng(0).permutation(len(train)))
+    for a, b in zip(train.__getitems__(idx), [train[i] for i in idx], strict=True):
+        assert all(torch.equal(a[k], b[k]) for k in ("x", "edge_index", "obs_names"))
+
+    masked = MaskedGraphDataset(train, mask_percentage=0.3, resample=True, seed=1)
+    batch, single = masked.__getitems__(idx), [masked[i] for i in idx]
+    assert all(torch.equal(a.mask, b.mask) and torch.equal(a.x, b.x) for a, b in zip(batch, single, strict=True))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fork start method is the Linux DataLoader default")
+def test_forked_workers_rebuild_the_read_pool(make_cfg, make_spatial_adata, tmp_path):
+    cfg = make_cfg()
+    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train")
+    train.__getitems__([0])  # the parent now owns a pool whose threads a forked child would not have
+    loader = DataLoader(train, batch_size=2, num_workers=2, multiprocessing_context="fork")
+    expected = [train[i] for i in range(len(train))]
+    got = [g for batch in loader for g in batch.to_data_list()]
+    assert all(torch.equal(a.x, b.x) for a, b in zip(got, expected, strict=True))
 
 
 def test_load_graph_datasets_trains_out_of_core(make_cfg, make_spatial_adata, tmp_path, monkeypatch):

@@ -33,6 +33,8 @@ import json
 import os
 import shutil
 import uuid
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -321,8 +323,10 @@ def write_graph_store(
 class ZarrGraphDataset(GraphDataset):
     """One split of a zarr graph store, as a contract dataset.
 
-    The zarr group is opened lazily and dropped on pickling, so each DataLoader worker opens its
-    own handle.
+    The zarr group and arrays are opened lazily and dropped on pickling, so each DataLoader worker
+    opens its own handle. :meth:`__getitems__` reads a whole batch on a thread pool: a graph read
+    is mostly waiting on storage latency (3-6 chunk reads), so overlapping them is what makes a
+    store on a network file system usable, and it needs no extra worker processes.
 
     Parameters
     ----------
@@ -332,6 +336,8 @@ class ZarrGraphDataset(GraphDataset):
         ``"train"``, ``"val"`` or ``"test"``.
     fingerprint
         If given, the store's fingerprint must equal it (see :func:`graph_store_fingerprint`).
+    read_threads
+        Threads :meth:`__getitems__` reads a batch's graphs with.
     """
 
     def __init__(
@@ -339,10 +345,12 @@ class ZarrGraphDataset(GraphDataset):
         path: str | os.PathLike,
         split: Literal["train", "val", "test"],
         fingerprint: dict | None = None,
+        read_threads: int = 16,
     ):
         self.path = Path(path)
         self.split = split
-        self._group = None
+        self.read_threads = read_threads
+        self._group = self._arrays = self._pool = self._pool_pid = None
         attrs = self.group.attrs.asdict()
         if not attrs.get("complete"):
             raise ValueError(f"{self.path} is not a complete graph store.")
@@ -364,8 +372,22 @@ class ZarrGraphDataset(GraphDataset):
             self._group = zarr.open_group(self.path, mode="r")
         return self._group
 
+    @property
+    def arrays(self) -> dict[str, zarr.Array]:
+        """The store's arrays, opened once per process (``group[name]`` re-reads the metadata)."""
+        if self._arrays is None:
+            self._arrays = dict(self.group.arrays())
+        return self._arrays
+
     def __getstate__(self):
-        return {**self.__dict__, "_group": None}
+        return {**self.__dict__, "_group": None, "_arrays": None, "_pool": None, "_pool_pid": None}
+
+    def __getitems__(self, indices: Sequence[int]) -> list[Data]:
+        """The graphs at ``indices``, read concurrently; torch's DataLoader calls this per batch."""
+        self.arrays  # open here, not racing in the threads
+        if self._pool is None or self._pool_pid != os.getpid():  # a forked child has no pool threads
+            self._pool, self._pool_pid = ThreadPoolExecutor(self.read_threads), os.getpid()
+        return list(self._pool.map(self.__getitem__, indices))
 
     def len(self) -> int:
         return len(self.graph_ids)
@@ -374,20 +396,20 @@ class ZarrGraphDataset(GraphDataset):
         graph = self.graph_ids[idx]
         rows = slice(int(self.node_ptr[graph]), int(self.node_ptr[graph + 1]))
         edges = slice(int(self.edge_ptr[graph]), int(self.edge_ptr[graph + 1]))
-        obs_index = torch.from_numpy(self.group["obs_index"][rows])
+        obs_index = torch.from_numpy(self.arrays["obs_index"][rows])
         data = Data(
-            x=torch.from_numpy(self.group["x"][rows]),
-            edge_index=torch.from_numpy(self.group["edge_index"][:, edges]).long(),
+            x=torch.from_numpy(self.arrays["x"][rows]),
+            edge_index=torch.from_numpy(self.arrays["edge_index"][:, edges]).long(),
             obs_index=obs_index,
             # The modules read len(obs_names) as the node count; geome stores the 1-based row
             # name as a float, which this reproduces.
             obs_names=(obs_index + 1).float(),
         )
         if self.class_names is not None:
-            codes = torch.from_numpy(self.group["label"][rows]).long()
+            codes = torch.from_numpy(self.arrays["label"][rows]).long()
             data.y = torch.nn.functional.one_hot(codes, self.num_classes).float()
         if self._has_embeddings:
-            data.embeddings = torch.from_numpy(self.group["embeddings"][rows])
+            data.embeddings = torch.from_numpy(self.arrays["embeddings"][rows])
         return data
 
     def _class_counts(self) -> np.ndarray:

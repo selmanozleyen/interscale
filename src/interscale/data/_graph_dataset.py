@@ -195,7 +195,16 @@ class MaskedGraphDataset(TorchDataset):
         return torch.Generator().manual_seed(seed)
 
     def __getitem__(self, idx: int) -> Data:
-        data = copy.copy(self.dataset[idx])
+        return self._masked(idx, self.dataset[idx])
+
+    def __getitems__(self, indices) -> list[Data]:
+        # Pass whole batches through, so a dataset that reads them concurrently (the zarr store) can.
+        fetch = getattr(self.dataset, "__getitems__", None)
+        items = fetch(indices) if fetch is not None else [self.dataset[i] for i in indices]
+        return [self._masked(i, data) for i, data in zip(indices, items, strict=True)]
+
+    def _masked(self, idx: int, data: Data) -> Data:
+        data = copy.copy(data)
         if "gene_mask" in data:
             del data.gene_mask
         if not self.enabled:
