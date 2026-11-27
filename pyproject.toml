@@ -46,7 +46,10 @@ dependencies = [
   "torch-geometric>=2",
   "torchmetrics>=1.8",
   "wandb",
-  "yacs"
+  "yacs",
+  # Graph stores (interscale.data): batched store reads build zarr's BasicIndexer against
+  # Array._chunk_grid, which zarr <= 3.1.6 does not have.
+  "zarr>=3.3",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://icb-interscale.readthedocs.io/"

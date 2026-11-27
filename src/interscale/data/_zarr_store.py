@@ -28,13 +28,13 @@ loads the matrix: only ``obs``, ``var`` and the coordinates are held in memory.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 import uuid
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -49,6 +49,9 @@ from anndata.io import read_elem, sparse_dataset
 from torch_geometric.data import Data
 from torch_geometric.utils import from_scipy_sparse_matrix
 from yacs.config import CfgNode as CN
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.indexing import BasicIndexer, Indexer
+from zarr.core.sync import sync
 
 from interscale.data._graph_dataset import GraphDataset
 
@@ -345,13 +348,61 @@ def write_graph_store(
 # ---------------------------------------------------------------------------------- reader
 
 
+def _runs(lo: np.ndarray, hi: np.ndarray) -> list[tuple[int, int]]:
+    """Non-empty ``[lo, hi)`` ranges in store order, with adjacent ones merged (consecutive graphs touch)."""
+    first = np.flatnonzero(np.r_[True, lo[1:] != hi[:-1]])
+    last = np.r_[first[1:] - 1, len(lo) - 1]
+    return [(int(a), int(b)) for a, b in zip(lo[first], hi[last], strict=True) if b > a]
+
+
+class _Runs(Indexer):
+    """Several slices along ``axis`` read back to back as one selection.
+
+    annbatch's ``MultiBasicIndexer``, along any axis. Every chunk piece of it is a slice, which the
+    zarrs codec pipeline serves; an integer selection with gaps inside a chunk makes zarrs fall back
+    to zarr-python for the whole read (``UnsupportedVIndexingError``).
+    """
+
+    def __init__(self, array: zarr.Array, runs: list[tuple[int, int]], axis: int):
+        self.axis, self.drop_axes = axis, ()
+        self.indexers = []
+        for lo, hi in runs:
+            selection = [slice(None)] * array.ndim
+            selection[axis] = slice(lo, hi)
+            self.indexers.append(BasicIndexer(tuple(selection), shape=array.shape, chunk_grid=array._chunk_grid))
+        shape = list(array.shape)
+        shape[axis] = sum(hi - lo for lo, hi in runs)
+        self.shape = tuple(shape)
+
+    def __iter__(self):
+        offset = 0
+        for indexer in self.indexers:
+            for projection in indexer:
+                out = list(projection.out_selection)
+                out[self.axis] = slice(offset + out[self.axis].start, offset + out[self.axis].stop)
+                yield projection._replace(out_selection=tuple(out))
+            offset += indexer.shape[self.axis]
+
+
+async def _gather(coroutines: list) -> list:
+    # gather inside the coroutine sync() runs, so its future belongs to zarr's event loop
+    return await asyncio.gather(*coroutines)
+
+
+async def _read_runs(array: zarr.Array, runs: list[tuple[int, int]], axis: int) -> np.ndarray:
+    indexer = _Runs(array, runs, axis)
+    out = np.empty(indexer.shape, dtype=array.dtype)
+    if runs:
+        prototype = default_buffer_prototype()
+        await array._async_array._get_selection(indexer, prototype=prototype, out=prototype.nd_buffer(out))
+    return out
+
+
 class ZarrGraphDataset(GraphDataset):
     """One split of a zarr graph store, as a contract dataset.
 
     The zarr group and arrays are opened lazily and dropped on pickling, so each DataLoader worker
-    opens its own handle. :meth:`__getitems__` reads a whole batch on a thread pool: a graph read
-    is mostly waiting on storage latency (3-6 chunk reads), so overlapping them is what makes a
-    store on a network file system usable, and it needs no extra worker processes.
+    opens its own handle. :meth:`__getitems__` reads a whole batch with one zarr call per array.
 
     Parameters
     ----------
@@ -361,8 +412,6 @@ class ZarrGraphDataset(GraphDataset):
         ``"train"``, ``"val"`` or ``"test"``.
     fingerprint
         If given, the store's fingerprint must equal it (see :func:`graph_store_fingerprint`).
-    read_threads
-        Threads :meth:`__getitems__` reads a batch's graphs with.
     """
 
     def __init__(
@@ -370,12 +419,10 @@ class ZarrGraphDataset(GraphDataset):
         path: str | os.PathLike,
         split: Literal["train", "val", "test"],
         fingerprint: dict | None = None,
-        read_threads: int = 16,
     ):
         self.path = Path(path)
         self.split = split
-        self.read_threads = read_threads
-        self._group = self._arrays = self._pool = self._pool_pid = None
+        self._group = self._arrays = None
         attrs = self.group.attrs.asdict()
         if not attrs.get("complete"):
             raise ValueError(f"{self.path} is not a complete graph store.")
@@ -405,14 +452,40 @@ class ZarrGraphDataset(GraphDataset):
         return self._arrays
 
     def __getstate__(self):
-        return {**self.__dict__, "_group": None, "_arrays": None, "_pool": None, "_pool_pid": None}
+        return {**self.__dict__, "_group": None, "_arrays": None}
+
+    @property
+    def _cell_keys(self) -> list[str]:
+        keys = ["obs_index", "x"]
+        return keys + ["label"] * (self.class_names is not None) + ["embeddings"] * self._has_embeddings
 
     def __getitems__(self, indices: Sequence[int]) -> list[Data]:
-        """The graphs at ``indices``, read concurrently; torch's DataLoader calls this per batch."""
-        _ = self.arrays  # open here, not racing in the threads
-        if self._pool is None or self._pool_pid != os.getpid():  # a forked child has no pool threads
-            self._pool, self._pool_pid = ThreadPoolExecutor(self.read_threads), os.getpid()
-        return list(self._pool.map(self.__getitem__, indices))
+        """The graphs at ``indices``, with one read per array; torch's DataLoader calls this per batch.
+
+        Reading graph by graph costs ~3 zarr calls per graph, and on a warm store nearly all of that
+        is zarr-python's per-call overhead, run on its single event-loop thread. Instead each array is
+        read once for the whole batch, as slice runs (:class:`_Runs`), all arrays concurrently.
+        """
+        graphs = self.graph_ids[np.asarray([self.indices()[i] for i in indices], dtype=np.int64)]
+        order = np.argsort(graphs, kind="stable")  # increasing store offsets
+        g = graphs[order]
+        node_lo, node_hi, edge_lo, edge_hi = (
+            self.node_ptr[g],
+            self.node_ptr[g + 1],
+            self.edge_ptr[g],
+            self.edge_ptr[g + 1],
+        )
+        arrays, keys = self.arrays, self._cell_keys
+        node_runs, edge_runs = _runs(node_lo, node_hi), _runs(edge_lo, edge_hi)
+        reads = [_read_runs(arrays[k], node_runs, 0) for k in keys] + [_read_runs(arrays["edge_index"], edge_runs, 1)]
+        *per_cell, edges = sync(_gather(reads))  # every array of the batch at once, on zarr's loop
+        cut = np.cumsum(node_hi - node_lo)[:-1]
+        cells = {k: np.split(v, cut) for k, v in zip(keys, per_cell, strict=True)}
+        edges = np.split(edges, np.cumsum(edge_hi - edge_lo)[:-1], axis=1)
+        out = [None] * len(indices)
+        for k, j in enumerate(order):
+            out[j] = self._graph(edge_index=edges[k], **{key: parts[k] for key, parts in cells.items()})
+        return out if self.transform is None else [self.transform(d) for d in out]
 
     def len(self) -> int:
         return len(self.graph_ids)
@@ -421,20 +494,23 @@ class ZarrGraphDataset(GraphDataset):
         graph = self.graph_ids[idx]
         rows = slice(int(self.node_ptr[graph]), int(self.node_ptr[graph + 1]))
         edges = slice(int(self.edge_ptr[graph]), int(self.edge_ptr[graph + 1]))
-        obs_index = torch.from_numpy(self.arrays["obs_index"][rows])
+        arrays = self.arrays
+        return self._graph(edge_index=arrays["edge_index"][:, edges], **{k: arrays[k][rows] for k in self._cell_keys})
+
+    def _graph(self, x, obs_index, edge_index, label=None, embeddings=None) -> Data:
+        obs_index = torch.from_numpy(obs_index)
         data = Data(
-            x=torch.from_numpy(self.arrays["x"][rows]),
-            edge_index=torch.from_numpy(self.arrays["edge_index"][:, edges]).long(),
+            x=torch.from_numpy(x),
+            edge_index=torch.from_numpy(edge_index).long(),
             obs_index=obs_index,
             # The modules read len(obs_names) as the node count; geome stores the 1-based row
             # name as a float, which this reproduces.
             obs_names=(obs_index + 1).float(),
         )
-        if self.class_names is not None:
-            codes = torch.from_numpy(self.arrays["label"][rows]).long()
-            data.y = torch.nn.functional.one_hot(codes, self.num_classes).float()
-        if self._has_embeddings:
-            data.embeddings = torch.from_numpy(self.arrays["embeddings"][rows])
+        if label is not None:
+            data.y = torch.nn.functional.one_hot(torch.from_numpy(label).long(), self.num_classes).float()
+        if embeddings is not None:
+            data.embeddings = torch.from_numpy(embeddings)
         return data
 
     def _class_counts(self) -> np.ndarray:

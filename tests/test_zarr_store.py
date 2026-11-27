@@ -180,12 +180,12 @@ def test_sharded_store_reads_back_the_same_graphs(make_cfg, make_spatial_adata, 
         write_graph_store(adata, cfg, tmp_path / "bad.zarr", chunk_rows=8, shard_rows=12)
 
 
-def test_batched_threaded_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path):
+def test_batched_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path):
     from interscale.data import MaskedGraphDataset
 
     cfg = make_cfg()
-    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train", read_threads=4)
-    idx = list(np.random.default_rng(0).permutation(len(train)))
+    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train")
+    idx = [*np.random.default_rng(0).permutation(len(train)).tolist(), 0]  # unsorted, with a repeat
     for a, b in zip(train.__getitems__(idx), [train[i] for i in idx], strict=True):
         assert all(torch.equal(a[k], b[k]) for k in ("x", "edge_index", "obs_names"))
 
@@ -195,10 +195,10 @@ def test_batched_threaded_reads_match_single_reads(make_cfg, make_spatial_adata,
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="fork start method is the Linux DataLoader default")
-def test_forked_workers_rebuild_the_read_pool(make_cfg, make_spatial_adata, tmp_path):
+def test_forked_workers_read_batches_after_the_parent_did(make_cfg, make_spatial_adata, tmp_path):
     cfg = make_cfg()
     train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train")
-    train.__getitems__([0])  # the parent now owns a pool whose threads a forked child would not have
+    train.__getitems__([0])  # the parent has open arrays and a zarr event loop before forking
     loader = DataLoader(train, batch_size=2, num_workers=2, multiprocessing_context="fork")
     expected = [train[i] for i in range(len(train))]
     got = [g for batch in loader for g in batch.to_data_list()]

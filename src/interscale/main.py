@@ -74,6 +74,12 @@ if __name__ == "__main__":
         default=1,
         help="DataLoader worker processes (default 1). Raise it when training from dataset.graph_store.",
     )
+    parser.add_argument(
+        "--zarrs",
+        action="store_true",
+        help="Read graph stores through the zarrs codec pipeline (pip install zarrs). Needs --num_workers 0: "
+        "zarrs deadlocks in forked DataLoader workers (zarrs-python#171).",
+    )
     args = parser.parse_args()
 
     if args.list_pairs:
@@ -84,4 +90,21 @@ if __name__ == "__main__":
     if args.model_type is None:
         parser.error("--model_type is required (LocalModel, GlobalModel or CombinedModel).")
 
+    if args.zarrs:
+        if args.num_workers:
+            parser.error("--zarrs needs --num_workers 0 (zarrs deadlocks in forked workers, zarrs-python#171).")
+        import zarr
+        import zarrs  # noqa: F401
+
+        zarr.config.set(
+            {
+                "codec_pipeline.path": "zarrs.ZarrsCodecPipeline",
+                # Keep up to 32 files open per array instead of reopening one per read -- each open is a
+                # metadata round trip on Lustre. Per array, not per process: ~9 arrays x 3 splits x 32
+                # stays under a 1024 ulimit -n. With 65536-row shards, 32 files cover ~2M cells, i.e. a
+                # whole store up to that size; larger ones still reopen shards, just far less often.
+                # Read by zarrs releases after 0.2.3 (zarrs-python#181); older ones ignore it.
+                "codec_pipeline.file_handle_cache_size": 32,
+            }
+        )
     main(resolve_cfg_from_args(args, parser=parser), args.model_type, num_workers=args.num_workers)
