@@ -91,7 +91,13 @@ def test_store_reproduces_prepare_geome_dataset(
 
     path = write_graph_store(_source(source, make_spatial_adata(sparse=sparse), tmp_path), cfg, tmp_path / "g.zarr")
 
-    _assert_same_graphs(open_graph_store(path, cfg), build_graph_datasets(make_spatial_adata(sparse=sparse), cfg))
+    stores, memory = open_graph_store(path, cfg), build_graph_datasets(make_spatial_adata(sparse=sparse), cfg)
+    _assert_same_graphs(stores, memory)
+    for store, mem in zip(stores, memory, strict=True):  # the batched read DataLoaders use, reversed order
+        idx = list(range(len(store)))[::-1]
+        for got, i in zip(store.__getitems__(idx), idx, strict=True):
+            for key in ("x", "edge_index", "y", "obs_names", "embeddings"):
+                assert (key in got) == (key in mem[i]) and (key not in got or torch.equal(got[key], mem[i][key]))
 
 
 def test_zero_expression_filter_matches_the_in_memory_one(make_cfg, make_spatial_adata, tmp_path):
@@ -107,10 +113,10 @@ def test_zero_expression_filter_matches_the_in_memory_one(make_cfg, make_spatial
     filtered = remove_zero_expression_cells(adata.copy())
     _assert_same_graphs(store, build_graph_datasets(filtered.copy(), cfg), keys=("x", "edge_index", "y"))
     kept = np.flatnonzero(np.asarray(adata.X.sum(axis=1)).ravel() != 0)
-    for dataset in store:  # obs_index points at rows of the file, not of the filtered AnnData
+    for dataset in store:  # source_row points at rows of the file, not of the filtered AnnData
         for i in range(len(dataset)):
-            assert not np.isin(dataset[i].obs_index.numpy(), empty).any()
-            assert np.isin(dataset[i].obs_index.numpy(), kept).all()
+            assert not np.isin(dataset[i].source_row.numpy(), empty).any()
+            assert np.isin(dataset[i].source_row.numpy(), kept).all()
 
 
 def test_graphs_are_contiguous_and_map_back_to_their_rows(make_cfg, make_spatial_adata, tmp_path):
@@ -120,7 +126,7 @@ def test_graphs_are_contiguous_and_map_back_to_their_rows(make_cfg, make_spatial
 
     for dataset in open_graph_store(path, cfg):
         for i in range(len(dataset)):
-            rows = dataset[i].obs_index.numpy()
+            rows = dataset[i].source_row.numpy()
             np.testing.assert_array_equal(dataset[i].x.numpy(), adata.X[rows])
             assert adata.obs["sample"].iloc[rows].nunique() == 1
             assert set(adata.obs["split"].iloc[rows]) == {dataset.split}
@@ -178,13 +184,17 @@ def test_sharded_store_reads_back_the_same_graphs(make_cfg, make_spatial_adata, 
     assert group["x"].shards[0] == 32 and group["edge_index"].shards == (2, 256)
     with pytest.raises(ValueError, match="multiple of chunk_rows"):
         write_graph_store(adata, cfg, tmp_path / "bad.zarr", chunk_rows=8, shard_rows=12)
+    assert not list(tmp_path.glob(".bad.zarr.tmp-*"))
 
 
-def test_batched_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path):
+@pytest.mark.parametrize(
+    "layout", [{}, {"chunk_rows": 8, "chunk_edges": 64, "shard_rows": 16}], ids=["plain", "sharded"]
+)
+def test_batched_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path, layout):
     from interscale.data import MaskedGraphDataset
 
     cfg = make_cfg()
-    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train")
+    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr", **layout), "train")
     idx = [*np.random.default_rng(0).permutation(len(train)).tolist(), 0]  # unsorted, with a repeat
     for a, b in zip(train.__getitems__(idx), [train[i] for i in idx], strict=True):
         assert all(torch.equal(a[k], b[k]) for k in ("x", "edge_index", "obs_names"))
@@ -194,7 +204,7 @@ def test_batched_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path
     assert all(torch.equal(a.mask, b.mask) and torch.equal(a.x, b.x) for a, b in zip(batch, single, strict=True))
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="fork start method is the Linux DataLoader default")
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
 def test_forked_workers_read_batches_after_the_parent_did(make_cfg, make_spatial_adata, tmp_path):
     cfg = make_cfg()
     train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), cfg, tmp_path / "g.zarr"), "train")
@@ -203,6 +213,14 @@ def test_forked_workers_read_batches_after_the_parent_did(make_cfg, make_spatial
     expected = [train[i] for i in range(len(train))]
     got = [g for batch in loader for g in batch.to_data_list()]
     assert all(torch.equal(a.x, b.x) for a, b in zip(got, expected, strict=True))
+
+
+def test_source_row_survives_batching(make_cfg, make_spatial_adata, tmp_path):
+    from torch_geometric.data import Batch
+
+    train = ZarrGraphDataset(write_graph_store(make_spatial_adata(), make_cfg(), tmp_path / "g.zarr"), "train")
+    graphs = train.__getitems__([0, 1])
+    assert torch.equal(Batch.from_data_list(graphs).source_row, torch.cat([g.source_row for g in graphs]))
 
 
 def test_load_graph_datasets_trains_out_of_core(make_cfg, make_spatial_adata, tmp_path, monkeypatch):

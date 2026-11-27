@@ -66,7 +66,10 @@ SPLITS = ("train", "val", "test")
 def graph_store_fingerprint(cfg: CN) -> dict:
     """The config values the graphs depend on: equal fingerprints build identical stores.
 
-    Training-only settings (masking, batch size, model, optimiser) are deliberately absent.
+    Training-only settings (masking, batch size, model, optimiser) are deliberately absent. The
+    source enters as its path string plus size and mtime, so moving or copying it (new mtime)
+    forces a rebuild, and for a ``.zarr`` directory an in-place rewrite of its arrays does not
+    change the directory's own stat and is not detected.
     """
     neighbors = {k: v for k, v in dict(cfg.dataset.spatial_neigbors_kwargs).items() if k != "library_key"}
     precomputed = cfg.model.global_component.get("parameters", CN()).get("type_gex_embedding") == "Precomputed"
@@ -216,8 +219,9 @@ def write_graph_store(
 
     Graphs are built and written one at a time. From a file path, only ``obs``, ``var`` and the
     spatial coordinates are loaded; each graph's rows of the expression matrix are read when it
-    is written, so memory is bounded by the largest graph. The store is written to a temporary
-    sibling directory and renamed into place once complete.
+    is written, so memory is bounded by the largest graph -- or, with ``shard_rows``, by one shard
+    per array (the writer buffers whole shards, e.g. 65536 x 5000 genes x 4 B = 1.3 GB for ``x``).
+    The store is written to a temporary sibling directory and renamed into place once complete.
 
     Parameters
     ----------
@@ -272,28 +276,27 @@ def write_graph_store(
     groups = list(_graph_groups(src.obs, cfg, keep))
     n_genes = len(src.var_names)
 
+    first = src.embeddings(groups[0][1][:1]) if groups else None
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
-    root = zarr.open_group(tmp, mode="w")
 
-    def per_cell(name, width, dtype):
+    def per_cell(name, width, dtype):  # root is opened inside the try below
         tail = (width,) if width else ()
         shards = None if shard_rows is None else (shard_rows, *tail)
         array = root.create_array(name, shape=(0, *tail), chunks=(chunk_rows, *tail), shards=shards, dtype=dtype)
         return _Appender(array)
 
-    x = per_cell("x", n_genes, "float32")
-    obs_index = per_cell("obs_index", 0, "int64")
-    label = per_cell("label", 0, "int32") if labels is not None else None
-    first = src.embeddings(groups[0][1][:1]) if groups else None
-    embed = per_cell("embeddings", first.shape[1], "float32") if first is not None else None
-    edge_shards = None if shard_rows is None else (2, chunk_edges * (shard_rows // chunk_rows))
-    edges = _Appender(
-        root.create_array("edge_index", shape=(2, 0), chunks=(2, chunk_edges), shards=edge_shards, dtype="int32"),
-        axis=1,
-    )
-
     node_ptr, edge_ptr, graph_split, class_counts = [0], [0], [], []
-    try:
+    try:  # from the first write on, any failure removes the temporary store
+        root = zarr.open_group(tmp, mode="w")
+        x = per_cell("x", n_genes, "float32")
+        obs_index = per_cell("obs_index", 0, "int64")
+        label = per_cell("label", 0, "int32") if labels is not None else None
+        embed = per_cell("embeddings", first.shape[1], "float32") if first is not None else None
+        edge_shards = None if shard_rows is None else (2, chunk_edges * (shard_rows // chunk_rows))
+        edges = _Appender(
+            root.create_array("edge_index", shape=(2, 0), chunks=(2, chunk_edges), shards=edge_shards, dtype="int32"),
+            axis=1,
+        )
         for split_name, rows in groups:
             stop = node_ptr[-1] + len(rows)
             x.add(src.x(rows))
@@ -347,6 +350,8 @@ def write_graph_store(
 
 def _runs(lo: np.ndarray, hi: np.ndarray) -> list[tuple[int, int]]:
     """Non-empty ``[lo, hi)`` ranges in store order, with adjacent ones merged (consecutive graphs touch)."""
+    if not len(lo):
+        return []
     first = np.flatnonzero(np.r_[True, lo[1:] != hi[:-1]])
     last = np.r_[first[1:] - 1, len(lo) - 1]
     return [(int(a), int(b)) for a, b in zip(lo[first], hi[last], strict=True) if b > a]
@@ -424,6 +429,10 @@ class ZarrGraphDataset(GraphDataset):
         attrs = group.attrs.asdict()
         if not attrs.get("complete"):
             raise ValueError(f"{self.path} is not a complete graph store.")
+        if attrs["fingerprint"].get("store_version") != STORE_VERSION:
+            raise ValueError(
+                f"{self.path} has store layout {attrs['fingerprint'].get('store_version')}, not {STORE_VERSION}."
+            )
         if fingerprint is not None and attrs["fingerprint"] != json.loads(json.dumps(fingerprint)):
             raise ValueError(
                 f"{self.path} was built for a different config.\n"
@@ -493,7 +502,8 @@ class ZarrGraphDataset(GraphDataset):
         data = Data(
             x=torch.from_numpy(x),
             edge_index=torch.from_numpy(edge_index).long(),
-            obs_index=obs_index,
+            # not "obs_index": PyG's Batch offsets every attribute named *index* by the node count
+            source_row=obs_index,
             # The modules read len(obs_names) as the node count; geome stores the 1-based row
             # name as a float, which this reproduces.
             obs_names=(obs_index + 1).float(),

@@ -195,6 +195,7 @@ class MaskedGraphDataset(TorchDataset):
         return torch.Generator().manual_seed(seed)
 
     def __getitem__(self, idx: int) -> Data:
+        idx = range(len(self))[idx]  # -1 and len-1 must draw the same mask (and SeedSequence needs >= 0)
         return self._masked(idx, self.dataset[idx])
 
     def __getitems__(self, indices) -> list[Data]:

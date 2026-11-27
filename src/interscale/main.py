@@ -71,8 +71,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=1,
-        help="DataLoader worker processes (default 1). Raise it when training from dataset.graph_store.",
+        default=None,
+        help="DataLoader worker processes (default 1, or 0 with --zarrs). 0 prefetches on a thread instead.",
     )
     parser.add_argument(
         "--zarrs",
@@ -90,6 +90,8 @@ if __name__ == "__main__":
     if args.model_type is None:
         parser.error("--model_type is required (LocalModel, GlobalModel or CombinedModel).")
 
+    if args.num_workers is None:
+        args.num_workers = 0 if args.zarrs else 1
     if args.zarrs:
         if args.num_workers:
             parser.error("--zarrs needs --num_workers 0 (zarrs deadlocks in forked workers, zarrs-python#171).")

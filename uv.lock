@@ -1595,7 +1595,7 @@ requires-dist = [
     { name = "torchmetrics", specifier = ">=1.8" },
     { name = "wandb" },
     { name = "yacs" },
-    { name = "zarr", specifier = ">=3.3" },
+    { name = "zarr", specifier = ">=3.3,<3.5" },
 ]
 
 [package.metadata.requires-dev]
