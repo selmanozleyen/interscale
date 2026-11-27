@@ -78,3 +78,33 @@ def test_node_mask_resample_callback_sets_the_trainer_epoch(make_datamodule):
     NodeMaskResampleCallback().on_train_epoch_start(_StubTrainer(), pl_module=None)
 
     assert dm.train_masked.epoch == 4
+
+
+def test_prefetch_yields_the_plain_loaders_batches(make_datamodule):
+    from interscale.geome_dataloader import _Prefetch
+
+    dm = make_datamodule(mask_percentage=0.5)  # num_workers=0 -> prefetched
+    loader = dm.val_dataloader()
+    assert isinstance(loader, _Prefetch) and len(loader) == len(loader.loader)
+    for a, b in zip(loader, loader.loader, strict=True):
+        assert torch.equal(a.x, b.x) and torch.equal(a.mask, b.mask)
+
+
+def test_prefetch_releases_its_thread_on_early_exit_and_forwards_errors():
+    import threading
+
+    import pytest
+
+    from interscale.geome_dataloader import _Prefetch
+
+    before = threading.active_count()
+    for _ in _Prefetch(range(1000), depth=2):
+        break
+    assert threading.active_count() == before
+
+    def broken():
+        yield 1
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        list(_Prefetch(broken()))

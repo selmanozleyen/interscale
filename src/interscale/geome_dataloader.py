@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import queue
+import threading
+from collections.abc import Iterator, Sequence
 from functools import partial
 from typing import Literal
 
@@ -9,6 +11,54 @@ from torch_geometric.loader import DataLoader
 from yacs.config import CfgNode as CN
 
 from interscale.data import GraphDataset, MaskedGraphDataset
+
+
+class _Prefetch:
+    """Iterate ``loader`` on a background thread, ``depth`` batches ahead.
+
+    For ``num_workers=0``: reading a batch from a graph store mostly waits on zarr I/O and decoding,
+    which release the GIL, so the next batch loads while the GPU runs the current step -- without a
+    worker process, which the zarrs codec pipeline cannot use (zarrs-python#171). Batches come out
+    in the same order as from ``loader``.
+    """
+
+    def __init__(self, loader: DataLoader, depth: int = 2):
+        self.loader, self.depth = loader, depth
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    def __iter__(self) -> Iterator:
+        q, stop, end = queue.Queue(self.depth), threading.Event(), object()
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def fill() -> None:
+            try:
+                for batch in self.loader:
+                    if not put(batch):
+                        return
+                put(end)
+            except BaseException as e:  # noqa: BLE001 -- handed to the consumer and re-raised there
+                put(e)
+
+        thread = threading.Thread(target=fill, daemon=True)
+        thread.start()
+        try:
+            while (item := q.get()) is not end:
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:  # the consumer stopped (sanity check, break, error): release the thread
+            stop.set()
+            thread.join()
 
 
 class GraphAnnDataModule(pl.LightningDataModule):
@@ -72,16 +122,17 @@ class GraphAnnDataModule(pl.LightningDataModule):
         """Select the training masks for ``epoch``; takes effect at the next train iterator."""
         self.train_masked.epoch = int(epoch)
 
-    def _loader(self, dataset: MaskedGraphDataset, shuffle: bool) -> DataLoader:
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers)
+    def _loader(self, dataset: MaskedGraphDataset, shuffle: bool) -> DataLoader | _Prefetch:
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers)
+        return loader if self.num_workers else _Prefetch(loader)
 
-    def train_dataloader(self) -> DataLoader:
+    def train_dataloader(self) -> DataLoader | _Prefetch:
         return self._loader(self.train_masked, shuffle=True)
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self) -> DataLoader | _Prefetch:
         return self._loader(self.val_masked, shuffle=False)
 
-    def test_dataloader(self) -> DataLoader:
+    def test_dataloader(self) -> DataLoader | _Prefetch:
         if self.test_masked is None:
             raise RuntimeError("No test set was given to this datamodule.")
         return self._loader(self.test_masked, shuffle=False)
