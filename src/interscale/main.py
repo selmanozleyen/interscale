@@ -24,7 +24,7 @@ def build_run(cfg, model_type: str, num_workers: int = 1):
     return model, GraphAnnDataModule.from_cfg(datasets, cfg, num_workers=num_workers)
 
 
-def main(cfg, model_type):
+def main(cfg, model_type, num_workers: int = 1):
     """Train a single model.
 
     Parameters
@@ -33,6 +33,9 @@ def main(cfg, model_type):
         An already-resolved config, or a path to a single config file to load.
     model_type : str
         One of ``LocalModel``, ``GlobalModel``, ``CombinedModel``.
+    num_workers : int
+        DataLoader worker processes. Raise it when training from a graph store
+        (``dataset.graph_store``), where each worker reads its graphs from disk.
     """
     # Accepts a path as well as a cfg so the historical main(cfg_path, model_type) call still
     # works; the CLI now resolves the config itself, since --dataset/--task layers several files.
@@ -40,7 +43,7 @@ def main(cfg, model_type):
         cfg = load_config(cfg)
 
     print(cfg)
-    model, dm = build_run(cfg, model_type)
+    model, dm = build_run(cfg, model_type, num_workers=num_workers)
     model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=cfg.optim.early_stopping)
 
 
@@ -65,6 +68,12 @@ if __name__ == "__main__":
         choices=list(MODEL_CLASSES),
         help="The model type: LocalModel, GlobalModel or CombinedModel.",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="DataLoader worker processes (default 1). Raise it when training from dataset.graph_store.",
+    )
     args = parser.parse_args()
 
     if args.list_pairs:
@@ -75,4 +84,4 @@ if __name__ == "__main__":
     if args.model_type is None:
         parser.error("--model_type is required (LocalModel, GlobalModel or CombinedModel).")
 
-    main(resolve_cfg_from_args(args, parser=parser), args.model_type)
+    main(resolve_cfg_from_args(args, parser=parser), args.model_type, num_workers=args.num_workers)
