@@ -159,9 +159,12 @@ def _graph_groups(obs, cfg: CN, keep: np.ndarray):
     for key in cfg.dataset.sample_key:
         codes = obs[key].astype("category").cat.codes.to_numpy()
         for split_name in SPLITS:
-            in_split = keep & (split == split_name)
-            for code in np.unique(codes[in_split & (codes >= 0)]):
-                yield split_name, np.flatnonzero(in_split & (codes == code))
+            # One stable sort per split, not one pass over every cell per graph: the per-graph
+            # scan was O(cells x graphs), hours at ~50M cells / ~80k windows. Stable keeps each
+            # graph's rows ascending and graphs in code order, as before.
+            rows = np.flatnonzero(keep & (split == split_name) & (codes >= 0))
+            rows = rows[np.argsort(codes[rows], kind="stable")]
+            yield from ((split_name, g) for g in np.split(rows, np.flatnonzero(np.diff(codes[rows])) + 1) if len(g))
 
 
 class _Appender:

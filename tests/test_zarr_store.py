@@ -37,6 +37,30 @@ def _assert_same_graphs(store_sets, memory_sets, keys=("x", "edge_index", "y", "
                     assert torch.equal(a[key], b[key]), f"graph {i}: {key} differs"
 
 
+def test_graph_groups_match_a_per_graph_scan():
+    import pandas as pd
+    from yacs.config import CfgNode as CN
+
+    from interscale.data._zarr_store import SPLITS, _graph_groups
+
+    rng = np.random.default_rng(0)
+    n = 5000
+    win = pd.Categorical(rng.choice([*"abcdefg", None], n), categories=[*"gfedcbaz"])  # unused 'z', NaN rows
+    obs = pd.DataFrame({"split": rng.choice(["train", "val", "test"], n), "w": win, "w2": rng.integers(0, 40, n)})
+    keep = rng.random(n) > 0.1
+    cfg = CN({"dataset": CN({"split_key": "split", "sample_key": ["w", "w2"]})})
+
+    expected = []
+    for key in cfg.dataset.sample_key:
+        codes = obs[key].astype("category").cat.codes.to_numpy()
+        for s in SPLITS:
+            in_split = keep & (obs["split"].to_numpy() == s)
+            expected += [(s, np.flatnonzero(in_split & (codes == c))) for c in np.unique(codes[in_split & (codes >= 0)])]
+    got = list(_graph_groups(obs, cfg, keep))
+    assert [s for s, _ in got] == [s for s, _ in expected]
+    assert all(np.array_equal(a, b) for (_, a), (_, b) in zip(got, expected, strict=True))
+
+
 def _source(kind, adata, tmp_path):
     """The same AnnData as an in-memory object, a backed object, or a path the writer opens."""
     if kind == "memory":
