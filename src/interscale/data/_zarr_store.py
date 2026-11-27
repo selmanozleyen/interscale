@@ -170,21 +170,31 @@ def _graph_groups(obs, cfg: CN, keep: np.ndarray):
 
 
 class _Appender:
-    """Appends along the last axis of a zarr array in whole chunks, so no chunk is rewritten."""
+    """Appends to a zarr array along ``axis`` in whole write units (shards, else chunks).
 
-    def __init__(self, array: zarr.Array):
-        self.array, self.parts, self.size = array, [], 0
+    Every unit is written exactly once: a partial write to a shard rewrites the whole shard file,
+    so writing graph by graph into a sharded array would cost O(shard size) per graph.
+    """
+
+    def __init__(self, array: zarr.Array, axis: int = 0):
+        self.array, self.axis, self.parts, self.size = array, axis, [], 0
+        self.unit = (array.shards or array.chunks)[axis]
 
     def add(self, block: np.ndarray) -> None:
         self.parts.append(block)
-        self.size += block.shape[-1]
-        if self.size >= self.array.chunks[-1]:
-            self.flush()
+        self.size += block.shape[self.axis]
+        if self.size >= self.unit:
+            self.flush(final=False)
 
-    def flush(self) -> None:
-        if self.parts:
-            self.array.append(np.concatenate(self.parts, axis=-1), axis=self.array.ndim - 1)
-            self.parts, self.size = [], 0
+    def flush(self, final: bool = True) -> None:
+        if not self.parts:
+            return
+        data = np.concatenate(self.parts, axis=self.axis)
+        n = data.shape[self.axis] if final else data.shape[self.axis] // self.unit * self.unit
+        head, tail = np.split(data, [n], axis=self.axis)
+        if n:
+            self.array.append(head, axis=self.axis)
+        self.parts, self.size = ([tail], tail.shape[self.axis]) if tail.shape[self.axis] else ([], 0)
 
 
 # ---------------------------------------------------------------------------------- writer
@@ -199,6 +209,7 @@ def write_graph_store(
     overwrite: bool = False,
     chunk_rows: int = 1024,
     chunk_edges: int = 65536,
+    shard_rows: int | None = None,
 ) -> Path:
     """Build every graph of ``source`` and write them to a zarr graph store.
 
@@ -226,6 +237,10 @@ def write_graph_store(
         Rows per chunk of the per-cell arrays; about one graph is a good size.
     chunk_edges
         Edges per chunk of ``edge_index``.
+    shard_rows
+        Rows per shard (a multiple of ``chunk_rows``), or None for one file per chunk. Sharding
+        packs many chunks into one file -- far fewer files on a parallel file system such as
+        Lustre -- and ``edge_index`` gets as many chunks per shard as the per-cell arrays.
 
     Returns
     -------
@@ -252,40 +267,50 @@ def write_graph_store(
 
     keep = src.expressed() if drop_zero_expression else np.ones(len(src.obs), dtype=bool)
     groups = list(_graph_groups(src.obs, cfg, keep))
-    n_total = sum(len(rows) for _, rows in groups)
     n_genes = len(src.var_names)
 
     tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:8]}")
     root = zarr.open_group(tmp, mode="w")
 
+    if shard_rows is not None and shard_rows % chunk_rows:
+        raise ValueError(f"shard_rows ({shard_rows}) must be a multiple of chunk_rows ({chunk_rows}).")
+
     def per_cell(name, width, dtype):
-        shape, chunks = ((n_total, width), (chunk_rows, width)) if width else ((n_total,), (chunk_rows,))
-        return root.create_array(name, shape=shape, chunks=chunks, dtype=dtype)
+        tail = (width,) if width else ()
+        shards = None if shard_rows is None else (shard_rows, *tail)
+        array = root.create_array(name, shape=(0, *tail), chunks=(chunk_rows, *tail), shards=shards, dtype=dtype)
+        return _Appender(array)
 
     x = per_cell("x", n_genes, "float32")
     obs_index = per_cell("obs_index", 0, "int64")
     label = per_cell("label", 0, "int32") if labels is not None else None
     first = src.embeddings(groups[0][1][:1]) if groups else None
     embed = per_cell("embeddings", first.shape[1], "float32") if first is not None else None
-    edges = _Appender(root.create_array("edge_index", shape=(2, 0), chunks=(2, chunk_edges), dtype="int32"))
+    edge_shards = None if shard_rows is None else (2, chunk_edges * (shard_rows // chunk_rows))
+    edges = _Appender(
+        root.create_array("edge_index", shape=(2, 0), chunks=(2, chunk_edges), shards=edge_shards, dtype="int32"),
+        axis=1,
+    )
 
     node_ptr, edge_ptr, graph_split, class_counts = [0], [0], [], []
     try:
         for split_name, rows in groups:
-            start, stop = node_ptr[-1], node_ptr[-1] + len(rows)
-            x[start:stop] = src.x(rows)
-            obs_index[start:stop] = rows
+            stop = node_ptr[-1] + len(rows)
+            x.add(src.x(rows))
+            obs_index.add(rows.astype(np.int64))
             if label is not None:
-                label[start:stop] = labels[rows]
+                label.add(labels[rows])
                 class_counts.append(np.bincount(labels[rows], minlength=len(class_names)))
             if embed is not None:
-                embed[start:stop] = src.embeddings(rows)
+                embed.add(src.embeddings(rows))
             graph_edges = _edge_index(src.coords[rows], fingerprint["spatial_neighbors"])
             edges.add(graph_edges)
             node_ptr.append(stop)
             edge_ptr.append(edge_ptr[-1] + graph_edges.shape[1])
             graph_split.append(SPLITS.index(split_name))
-        edges.flush()
+        for appender in (x, obs_index, label, embed, edges):
+            if appender is not None:
+                appender.flush()
 
         root.create_array("node_ptr", data=np.asarray(node_ptr, dtype=np.int64))
         root.create_array("edge_ptr", data=np.asarray(edge_ptr, dtype=np.int64))
@@ -384,7 +409,7 @@ class ZarrGraphDataset(GraphDataset):
 
     def __getitems__(self, indices: Sequence[int]) -> list[Data]:
         """The graphs at ``indices``, read concurrently; torch's DataLoader calls this per batch."""
-        self.arrays  # open here, not racing in the threads
+        _ = self.arrays  # open here, not racing in the threads
         if self._pool is None or self._pool_pid != os.getpid():  # a forked child has no pool threads
             self._pool, self._pool_pid = ThreadPoolExecutor(self.read_threads), os.getpid()
         return list(self._pool.map(self.__getitem__, indices))

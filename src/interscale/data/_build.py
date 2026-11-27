@@ -103,7 +103,13 @@ def load_graph_datasets(cfg: CN) -> list:
         print(f"Writing graph store {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         if cfg.dataset.segmentation_robustness is None:
-            write_graph_store(cfg.dataset.h5ad_data, cfg, path, drop_zero_expression=True)
+            write_graph_store(
+                cfg.dataset.h5ad_data,
+                cfg,
+                path,
+                drop_zero_expression=True,
+                shard_rows=cfg.dataset.graph_store_shard_rows,
+            )
         else:
-            write_graph_store(load_training_adata(cfg), cfg, path)
+            write_graph_store(load_training_adata(cfg), cfg, path, shard_rows=cfg.dataset.graph_store_shard_rows)
     return open_graph_store(path, cfg)

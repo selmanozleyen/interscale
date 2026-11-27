@@ -57,7 +57,9 @@ def test_graph_groups_match_a_per_graph_scan():
         codes = obs[key].astype("category").cat.codes.to_numpy()
         for s in SPLITS:
             in_split = keep & (obs["split"].to_numpy() == s)
-            expected += [(s, np.flatnonzero(in_split & (codes == c))) for c in np.unique(codes[in_split & (codes >= 0)])]
+            expected += [
+                (s, np.flatnonzero(in_split & (codes == c))) for c in np.unique(codes[in_split & (codes >= 0)])
+            ]
     got = list(_graph_groups(obs, cfg, keep))
     assert [s for s, _ in got] == [s for s, _ in expected]
     assert all(np.array_equal(a, b) for (_, a), (_, b) in zip(got, expected, strict=True))
@@ -162,6 +164,20 @@ def test_workers_open_their_own_handle_and_read_the_same_graphs(make_cfg, make_s
 
     for i, batch in enumerate(DataLoader(train, batch_size=1, shuffle=False, num_workers=2)):
         assert torch.equal(batch.x, train[i].x)
+
+
+def test_sharded_store_reads_back_the_same_graphs(make_cfg, make_spatial_adata, tmp_path):
+    import zarr
+
+    cfg, adata = make_cfg(), make_spatial_adata()
+    plain = write_graph_store(adata, cfg, tmp_path / "plain.zarr")
+    # Tiny units so every array spans several shards and the last shard is partial.
+    sharded = write_graph_store(adata, cfg, tmp_path / "sharded.zarr", chunk_rows=8, chunk_edges=64, shard_rows=32)
+    _assert_same_graphs(open_graph_store(sharded), open_graph_store(plain))
+    group = zarr.open_group(sharded, mode="r")
+    assert group["x"].shards[0] == 32 and group["edge_index"].shards == (2, 256)
+    with pytest.raises(ValueError, match="multiple of chunk_rows"):
+        write_graph_store(adata, cfg, tmp_path / "bad.zarr", chunk_rows=8, shard_rows=12)
 
 
 def test_batched_threaded_reads_match_single_reads(make_cfg, make_spatial_adata, tmp_path):

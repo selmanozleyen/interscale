@@ -26,6 +26,9 @@ def get_dataset_cfg(cfg):
     cfg.dataset.split_key = "split"
     # Directory for out-of-core graph stores (interscale.data.load_graph_datasets); None = in memory.
     cfg.dataset.graph_store = None
+    # Rows per zarr shard when writing a graph store (None: one file per chunk). Layout only -- not part of
+    # the store fingerprint, so a store written either way is reused by the other setting.
+    cfg.dataset.graph_store_shard_rows = None
 
     cfg.dataset.batch_size = 32
     cfg.dataset.train_size = 0.7
