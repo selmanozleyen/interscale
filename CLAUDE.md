@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-InterScale is a Python package for multi-scale cell interaction analysis in spatial transcriptomics data. It combines a local, graph-based component (cell-neighborhood scale) with a global, transformer-based component (whole-sample scale) into a single trainable model. It is built on top of `geome`/PyTorch Geometric, AnnData, scanpy/squidpy, `scvi-tools` (for AnnData registration/data management), and `lightning`/`pytorch_lightning` for training.
+InterScale is a Python package for multi-scale cell interaction analysis in spatial transcriptomics data. It combines a local, graph-based component (cell-neighborhood scale) with a global, transformer-based component (whole-sample scale) into a single trainable model. It is built on top of `geome`/PyTorch Geometric, AnnData, scanpy/squidpy, and `lightning`/`pytorch_lightning` for training. `scvi-tools` is used only for `scvi.nn.Encoder` in the `SCVI` local module; data handling does not go through it.
 
 For the scientific motivation, model design rationale, and terminology behind this architecture (from the InterScale preprint — Drummer, Jiménez et al., bioRxiv 2026), see [`.claude/background.md`](.claude/background.md). Read it before working on model/module architecture, loss functions, or the interpretability/evaluation pipeline — it explains _why_ the local/global split and dual-decoder design exist, not just what the code does.
 
@@ -60,10 +60,11 @@ Everything is driven by a single `yacs` `CfgNode` (`cfg`), built via `interscale
 
 ### Model hierarchy (`interscale.model`)
 
-`BaseModel` (`model/base/_base_model.py`) mimics the `scvi-tools` model API pattern:
-- Uses an `scvi.data.AnnDataManager` (registered via `_setup_anndata`/`register_fields`) to validate and access fields on the `AnnData` object (expression layer, sample/library keys, prediction obs, split key). This is why models require `ModelClass._setup_anndata(...)` to be called before instantiation — it registers the manager keyed by an AnnData UUID stored in `adata.uns`.
+`BaseModel` (`model/base/_base_model.py`) is built from a PyG dataset, not from an AnnData:
+- `Model(train_dataset, cfg)` takes an `interscale.data.GraphDataset` (normally `build_graph_datasets(adata, cfg)[0]`) and reads only metadata from it: `n_input = dataset.num_node_features`, `n_output` = `dataset.num_classes` (classification) or `n_input` (regression), `class_labels = dataset.class_names`, and `WeightedCE` weights from `dataset.label_counts(prediction_level)`. It keeps no reference to the data. There is no `_setup_anndata` and no `AnnDataManager`.
+- `get_model_output(adata)` still works on an AnnData (it rebuilds the graphs with `prepare_a2d_dataset`); `_check_adata` rejects one whose genes differ from the model's `var_names`.
 - `prediction_task` is `"classification"` or `"regression"`; `prediction_level` is `"node"` or `"graph"` — these gate a lot of branching throughout the codebase (loss selection, decoder output shape, evaluation output storage).
-- `save`/`load` persist only the module `state_dict`, with filenames derived from `tl.utils.get_model_filename_prefix(cfg, local_component, global_component)`. `load` includes legacy state-dict key remapping (`global_module.module.` → `global_module.`, stripped `module.` prefixes, and `tl.utils.detect_and_remap_state_dict_keys`) to stay compatible with older/wandb-saved checkpoints.
+- `save`/`load` persist the module `state_dict` plus an `attr_dict` (`n_input`, `n_output`, `var_names`, `class_labels`) that `load(dir_path, dataset, cfg, ...)` checks against the dataset it is given (checkpoints without it skip the check), with filenames derived from `tl.utils.get_model_filename_prefix(cfg, local_component, global_component)`. `load` includes legacy state-dict key remapping (`global_module.module.` → `global_module.`, stripped `module.` prefixes, and `tl.utils.detect_and_remap_state_dict_keys`) to stay compatible with older/wandb-saved checkpoints.
 
 Three concrete models subclass `BaseModel`, differing in which components they instantiate and which module class they wrap:
 - `LocalModel` — local (graph) component only.
@@ -80,13 +81,21 @@ Mirrors the model hierarchy at the `pytorch_lightning`/`LightningModule` level:
 - `module/global_modules/` — transformer-based global encoder (`TransformerNodeEncoderHook`) plus supporting transformer encoder/layer/utils, encoding whole-sample (long-range) context across cells.
 - `module/combined_module/` — `CombinedModule` and `DualDecoderCombinedModule` compose a local module + global module sequentially: local embeddings feed into the global (transformer) component, and predictions/attention/CLS tokens are extracted from there (see `CombinedModel.get_model_output` in `model/combined_model.py` for the full inference/evaluation flow, including how attention matrices and horizontal/vertical CLS tokens are extracted and padded to `max_seq_len`).
 
+### Data contract (`interscale.data`)
+
+Everything between storage and model is a `torch_geometric.data.Dataset` following one contract (`data/_graph_dataset.py`, read its module docstring):
+- `GraphDataset` — `len()`/`get(i)` return one `Data` per sample/window with `x [N, G]`, `edge_index`, and for classification a one-hot `y [N, C]`; metadata `var_names`, `class_names`, `label_counts(level)`. `num_node_features`/`num_classes` are overridden to come from metadata, because PyG's defaults load data (`num_classes` loads *every* graph). New storage backends (e.g. an on-disk store) implement this and nothing else changes.
+- `InMemoryGraphDataset` — the list-backed implementation; validates `x`/`y` widths against the metadata.
+- `MaskedGraphDataset` — wraps any contract dataset and attaches `mask`/`gene_mask` to a *shallow copy* of each item, drawn from a generator seeded by `(seed, epoch, idx)` (train) or `(seed, idx)` (val/test). Stored graphs are never mutated, and draws do not depend on `num_workers`.
+- `build_graph_datasets(adata, cfg)` — `prepare_geome_dataset` + metadata → `[train, val(, test)]`.
+
 ### Data pipeline: AnnData → PyG graphs
 
 `interscale.tl.geome_utils.prepare_geome_dataset` / `prepare_a2d_dataset` bridge AnnData and PyTorch Geometric using `geome`:
 - Iterates per-sample/library (`cfg.dataset.sample_key`), builds a spatial neighbor graph per sample (`squidpy`-style `spatial_neigbors_kwargs`, converted to an edge index via `geome.transforms.AddEdgeIndex`), and yields one PyG `Data` object per sample.
 - Splits data by `cfg.dataset.split_key` (an `adata.obs` column that must contain `train`/`val`, optionally `test`) — this must exist in the AnnData before calling `prepare_geome_dataset`.
 - Handles both classification (one-hot encodes `prediction_obs`) and regression prediction tasks, and optionally attaches precomputed embeddings (`cfg.model.global_component.parameters.type_gex_embedding == "Precomputed"`) from `adata.obsm`.
-- `interscale.geome_dataloader.GraphAnnDataModule` wraps the resulting `list[Data]` splits into a `LightningDataModule`. For node-level learning it corrupts the reconstruction input for each dataloader construction (redrawn every epoch by `NodeMaskResampleCallback`) — this is the masking scheme used for self-supervised node reconstruction/robustness experiments referenced in `config_files/legnini_example.yaml`'s `pct_mask_nodes` and `dataset.segmentation_robustness`.
+- `interscale.geome_dataloader.GraphAnnDataModule` takes the contract datasets (plain `list[Data]` is wrapped) and wraps each split in a `MaskedGraphDataset`. Train masks are redrawn every epoch: `NodeMaskResampleCallback` calls `dm.set_epoch(trainer.current_epoch)` in `on_train_epoch_start`, which Lightning runs before it creates the epoch's iterator, so the epoch is pickled into freshly spawned workers (do not enable `persistent_workers`). Val/test are masked only for node-level learning. This is the masking scheme used for self-supervised node reconstruction/robustness experiments referenced in `config_files/legnini_example.yaml`'s `pct_mask_nodes` and `dataset.segmentation_robustness`.
 
 ### Masking (`tl/masking.py`)
 

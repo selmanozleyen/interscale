@@ -98,7 +98,7 @@ levels (`interscale.evaluation`):
 
 | Paper notation                                    | Meaning                                                     | Code                                                                                                 |
 | ------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `X ∈ R^{N,F}`                                     | gene expression matrix (cells × genes)                      | expression layer registered via `AnnDataManager`                                                     |
+| `X ∈ R^{N,F}`                                     | gene expression matrix (cells × genes)                      | `data.x` of each graph (built from `cfg.dataset.layer_key`)                                                     |
 | `A`                                               | adjacency / spatial connectivity matrix                     | built via `squidpy.gr.spatial_neighbors`, converted to edge index by `geome.transforms.AddEdgeIndex` |
 | `H_local` / `E_local`                             | local (neighborhood) embedding                              | local module output                                                                                  |
 | `H_global` / `E_global`                           | global (tissue-wide) embedding                              | global module (transformer) output                                                                   |

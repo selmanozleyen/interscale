@@ -1,21 +1,14 @@
 import logging
 import os
-from abc import ABCMeta, abstractmethod
-from collections.abc import Sequence
-from uuid import uuid4
+from abc import ABC, abstractmethod
 
 import numpy as np
 import pandas as pd
-import scvi
 import torch
 from anndata import AnnData
-from scvi.data import AnnDataManager, fields
-from scvi.data._constants import (
-    _SCVI_UUID_KEY,
-)
-from scvi.data._utils import _assign_adata_uuid, _check_if_view
 from yacs.config import CfgNode as CN
 
+from interscale.data import GraphDataset
 from interscale.module.base import GlobalModule, LocalModule
 from interscale.module.global_modules import TransformerNodeEncoderHook
 from interscale.module.local_modules import GCN
@@ -42,54 +35,22 @@ SAVE_KEYS = _SAVE_KEYS_NT()
 _OPTIONAL_STATE_PREFIXES = ("pca_",)
 
 
-# adjusted from scvi-tools
-# https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-# accessed on 22.April 2025
-class BaseModelMeta(ABCMeta):
-    """Metaclass for :class:`~scvi.model.base.BaseModel`.
+class BaseModel(ABC):
+    """Abstract class for InterScale models.
 
-    Constructs model class-specific mappings for :class:`~scvi.data.AnnDataManager` instances.
-    ``cls._setup_adata_manager_store`` maps from AnnData object UUIDs to
-    :class:`~scvi.data.AnnDataManager` instances.
-
-    This mapping is populated everytime ``cls.setup_anndata()`` is called.
-    ``cls._per_isntance_manager_store`` maps from model instance UUIDs to AnnData UUID:
-    :class:`~scvi.data.AnnDataManager` mappings.
-    These :class:`~scvi.data.AnnDataManager` instances are tied to a single model instance and
-    populated either
-    during model initialization or after running ``self._validate_anndata()``.
-    """
-
-    @abstractmethod
-    def __init__(cls, name, bases, dct):
-        cls._setup_adata_manager_store: dict[
-            str, type[AnnDataManager]
-        ] = {}  # Maps adata id to AnnDataManager instances.
-        cls._per_instance_manager_store: dict[
-            str, dict[str, type[AnnDataManager]]
-        ] = {}  # Maps model instance id to AnnDataManager mappings.
-        super().__init__(name, bases, dct)
-
-
-class BaseModel(metaclass=BaseModelMeta):
-    """Abstract class for InterScale models
+    A model is built from a :class:`~interscale.data.GraphDataset` -- normally the training
+    split -- and reads only metadata from it: the feature width, the class names and, for
+    ``WeightedCE``, the per-class training counts. It holds no reference to the data.
 
     Parameters
     ----------
-    adata
-        AnnData object
-    decoder
-        Decoder type either linear or nonlinear
-    prediction_obs
-        Key in `adata.obs` that contains the prediction information.
+    dataset
+        The training split, as an InterScale contract dataset.
+    cfg
+        The run config.
     """
 
-    def __init__(
-        self,
-        adata: AnnData,
-        cfg: CN,
-    ):
-        self.id = str(uuid4())  # Used for cls._manager_store keys.
+    def __init__(self, dataset: GraphDataset, cfg: CN):
         self._cfg = cfg
 
         self.prediction_task = cfg.dataset.prediction_task
@@ -99,300 +60,75 @@ class BaseModel(metaclass=BaseModelMeta):
         )
         assert self.prediction_level in ["node", "graph"], "Prediction level must be either 'node' or 'graph'."
 
-        # scvi-tools like data handling
-        self._adata = adata
-        self._adata_manager = self._get_most_recent_anndata_manager(adata, required=True)
-        self._register_manager_for_instance(self._adata_manager)
-        # Suffix registry instance variable with _ to include it when saving the model.
-        self.registry_ = self._adata_manager.registry
-        self.summary_stats = self._adata_manager.summary_stats
-        # TODO: check that anndata is set up in coherence with the cfg file
+        self.var_names = list(dataset.var_names)
+        self.class_labels = None
+        if self.prediction_task == "classification":
+            if dataset.class_names is None:
+                raise ValueError("A classification model needs a dataset with class_names.")
+            self.class_labels = list(dataset.class_names)
 
-        self.n_input = self.summary_stats["n_x"]
+        self.n_input = dataset.num_node_features
         self.n_embed = self._cfg.model.n_embed
-        self.n_output = (
-            self.summary_stats["n_prediction_obs"]
-            if self.prediction_task == "classification"
-            else self.summary_stats["n_x"]
-        )
+        self.n_output = dataset.num_classes if self.prediction_task == "classification" else self.n_input
 
         self.is_trained_ = False
         self._model_summary_string = f"{self.prediction_task} model for {self.prediction_level} prediction. \n"
-        self.train_indices_ = None
-        self.test_indices_ = None
-        self.validation_indices_ = None
         self.history_ = None
 
         self.local_component = False
         self.global_component = False
-        if self.prediction_task == "classification":
-            self.class_labels = self._adata.obs[self._cfg.dataset.prediction_obs].cat.categories
 
         self.class_weights = None
         if self._cfg.optim.loss == "WeightedCE":
-            self.class_weights = self._compute_train_class_weights()
+            self.class_weights = self._compute_train_class_weights(dataset)
 
-    def _training_unit_labels(self) -> pd.Series:
-        """Labels of the units the loss is computed over, restricted to the train split.
+    def _compute_train_class_weights(self, dataset: GraphDataset) -> torch.Tensor:
+        """Compute ``"balanced"`` class weights over the training units of ``dataset``.
 
-        For ``prediction_level == "node"`` a unit is a cell. For ``"graph"`` a unit is one PyG
-        graph, i.e. one category of each key in ``cfg.dataset.sample_key`` -- matching how
-        :func:`interscale.tl.prepare_geome_dataset` builds and concatenates graphs.
-
-        Returns
-        -------
-        pd.Series
-            One label per training unit.
-        """
-        obs = self._adata.obs
-        pred_col = self._cfg.dataset.prediction_obs
-        split_col = self._cfg.dataset.split_key
-
-        if split_col is not None and split_col in obs:
-            train_obs = obs.loc[obs[split_col].astype(str) == "train"]
-        else:
-            logger.warning("split_key '%s' not in adata.obs -- class weights use all cells.", split_col)
-            train_obs = obs
-        if len(train_obs) == 0:
-            raise ValueError(f"No observations with {split_col} == 'train'; cannot compute class weights.")
-
-        if self.prediction_level == "node":
-            return train_obs[pred_col].astype(str)
-
-        labels = []
-        for key in self._cfg.dataset.sample_key:
-            grouped = train_obs.groupby(key, observed=True)[pred_col]
-            n_per_graph = grouped.nunique()
-            if (n_per_graph > 1).any():
-                logger.warning(
-                    "%d graphs of '%s' contain more than one '%s'; using the majority label.",
-                    int((n_per_graph > 1).sum()),
-                    key,
-                    pred_col,
-                )
-            labels.append(grouped.agg(lambda s: s.value_counts().idxmax()).astype(str))
-        return pd.concat(labels)
-
-    def _compute_train_class_weights(self) -> torch.Tensor:
-        """Compute ``"balanced"`` class weights over the training units.
-
-        Weights are ordered like :attr:`class_labels` (i.e. ``.cat.categories``), which is also
-        the column order of the one-hot ``data.y`` produced by ``geome``, so index *i* of the
-        returned tensor lines up with logit column *i*.
+        A unit is a cell for ``prediction_level == "node"`` and a graph -- counted by its majority
+        label -- for ``"graph"``. Weights are ordered like :attr:`class_labels`, the column order
+        of the one-hot ``data.y``, so index *i* of the returned tensor lines up with logit *i*.
 
         Returns
         -------
         torch.Tensor
             Float32 tensor of per-class weights.
         """
-        y = self._training_unit_labels()
-        classes = [str(c) for c in self.class_labels]
-        counts = y.value_counts().reindex(classes).fillna(0.0).to_numpy(dtype=np.float64)
+        classes = self.class_labels
+        counts = np.asarray(dataset.label_counts(self.prediction_level), dtype=np.float64)
         if (counts == 0).any():
             missing = [c for c, n in zip(classes, counts, strict=True) if n == 0]
             raise ValueError(f"Classes {missing} have no training units; WeightedCE weights undefined.")
         # Same formula as sklearn's compute_class_weight("balanced").
         weights = counts.sum() / (len(classes) * counts)
         print(
-            f"WeightedCE ({self.prediction_level}-level, train split '{self._cfg.dataset.split_key}'): "
+            f"WeightedCE ({self.prediction_level}-level): "
             + ", ".join(f"{c}: n={int(n)} w={w:.4f}" for c, n, w in zip(classes, counts, weights, strict=True))
         )
         return torch.as_tensor(weights, dtype=torch.float32)
 
-    @classmethod
-    def _setup_anndata(
-        cls,
-        adata: AnnData,
-        *,
-        layer_key: str,
-        sample_key_list: list[str],
-        prediction_task: str = "regression",
-        prediction_obs: str = None,
-        group_key: str | None = None,
-        split_key: str | None = "split",
-        view_registry: bool = True,
-    ):
+    def _check_adata(self, adata: AnnData) -> AnnData:
+        """Check ``adata`` against the model and make it writable for :meth:`get_model_output`.
+
+        Raises unless ``adata`` has the genes the model was built for, in the same order. A view
+        is turned into an actual AnnData in place, since the output is written into it.
         """
-        Sets up the AnnDataManager for the model.
-
-        Parameters
-        ----------
-        cls
-            Class of the model. Required for class method.
-        adata
-            AnnData object
-        layer_key
-            Key in `adata.layers` that contains the data. If None, uses `adata.X` by default.
-        prediction_task
-            Prediction task for the model. Either "classification" or "regression". Default is "regression".
-        prediction_obs:
-            Key in `adata.obs` that contains the prediction information.
-        sample_key
-            Key in `adata.obs` that contains the sample information. For example, if the data is split by FOV or sliding windows.
-        split_key
-            Key in `adata.obs` that contains the split information.
-        group_key
-            Key in `adata.obs` that contains the group information.
-            Only required if split should stratify groups of group_key, usually this should be condition. Otherwise random split.
-        """
-        anndata_fields = [fields.LayerField("x", layer=layer_key)]
-
-        for i, key in enumerate(sample_key_list):
-            anndata_fields.append(fields.CategoricalObsField(registry_key=f"sample_key_{i}", attr_key=key))
-
-        if prediction_task == "classification":
-            anndata_fields.append(fields.CategoricalObsField(registry_key="prediction_obs", attr_key=prediction_obs))
-
-        if split_key is not None:
-            anndata_fields.append(fields.CategoricalObsField(registry_key="split_key", attr_key=split_key))
-            # Check that split_key contains required values
-            assert {"train", "val"}.issubset(set(adata.obs[split_key].unique())), (
-                f"'{split_key}' must contain 'train' and 'val' categories"
-            )
-
-        manager = scvi.data.AnnDataManager(anndata_fields)
-        manager.register_fields(adata)
-        if view_registry:
-            manager.view_registry()
-
-        # Store the manager in the class's store
-        if _SCVI_UUID_KEY not in adata.uns:
-            adata.uns[_SCVI_UUID_KEY] = str(id(adata))
-        cls._setup_adata_manager_store[adata.uns[_SCVI_UUID_KEY]] = manager
-        cls.sample_key_list = sample_key_list
-
-    # adjusted from scvi-tools
-    # https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-    # accessed on 22.April 2025
-    @classmethod
-    def _get_most_recent_anndata_manager(cls, adata: AnnData, required: bool = False) -> AnnDataManager | None:
-        """Retrieves the :class:`~scvi.data.AnnDataManager` for a given AnnData object.
-
-        Checks for the most recent :class:`~scvi.data.AnnDataManager` created for the given AnnData
-        object via ``setup_anndata()`` on model initialization. Unlike
-        :meth:`scvi.model.base.BaseModel.get_anndata_manager`, this method is not model
-        instance specific and can be called before a model is fully initialized.
-
-        Parameters
-        ----------
-        adata
-            AnnData object to find manager instance for.
-        required
-            If True, errors on missing manager. Otherwise, returns None when manager is missing.
-        """
-        if _SCVI_UUID_KEY not in adata.uns:
-            if required:
-                raise ValueError(f"Please set up your AnnData with {cls.__name__}.setup_anndata first.")
-            return None
-
-        adata_id = adata.uns[_SCVI_UUID_KEY]
-
-        if adata_id not in cls._setup_adata_manager_store:
-            if required:
-                raise ValueError(
-                    f"Please set up your AnnData with {cls.__name__}.setup_anndata first. "
-                    "It appears the AnnData object has been setup with a different model."
-                )
-            return None
-
-        adata_manager = cls._setup_adata_manager_store[adata_id]
-        if adata_manager.adata is not adata:
-            raise ValueError(
-                "The provided AnnData object does not match the AnnData object "
-                "previously provided for setup. Did you make a copy?"
-            )
-
-        return adata_manager
-
-    # adjusted from scvi-tools
-    # https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-    # accessed on 22.April 2025
-    def _register_manager_for_instance(self, adata_manager: AnnDataManager):
-        """Registers an :class:`~scvi.data.AnnDataManager` instance with this model instance.
-
-        Creates a model-instance specific mapping in ``cls._per_instance_manager_store`` for this
-        :class:`~scvi.data.AnnDataManager` instance.
-        """
-        if self.id not in self._per_instance_manager_store:
-            self._per_instance_manager_store[self.id] = {}
-
-        adata_id = adata_manager.adata_uuid
-        instance_manager_store = self._per_instance_manager_store[self.id]
-        instance_manager_store[adata_id] = adata_manager
-
-    # adjusted from scvi-tools
-    # https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-    # accessed on 22.April 2025
-    def get_anndata_manager(self, adata: AnnData, required: bool = False) -> AnnDataManager | None:
-        """Retrieves the :class:`~scvi.data.AnnDataManager` for a given AnnData object.
-
-        Requires ``self.id`` has been set. Checks for an :class:`~scvi.data.AnnDataManager`
-        specific to this model instance.
-
-        Parameters
-        ----------
-        adata
-            AnnData object to find manager instance for.
-        required
-            If True, errors on missing manager. Otherwise, returns None when manager is missing.
-        """
-        cls = self.__class__
-        if _SCVI_UUID_KEY not in adata.uns:
-            if required:
-                raise ValueError(
-                    f"Please set up your AnnData with {cls.__name__}.setup_anndata'"
-                    "or {cls.__name__}.setup_mudata first."
-                )
-            return None
-
-        adata_id = adata.uns[_SCVI_UUID_KEY]
-        if self.id not in cls._per_instance_manager_store:
-            if required:
-                raise AssertionError(
-                    "Unable to find instance specific manager store. "
-                    "The model has likely not been initialized with an AnnData object."
-                )
-            return None
-        elif adata_id not in cls._per_instance_manager_store[self.id]:
-            if required:
-                raise AssertionError("Please call ``self._validate_anndata`` on this AnnData or MuData object.")
-            return None
-
-        adata_manager = cls._per_instance_manager_store[self.id][adata_id]
-        if adata_manager.adata is not adata:
-            logger.info("AnnData object appears to be a copy. Attempting to transfer setup.")
-            _assign_adata_uuid(adata, overwrite=True)
-            adata_manager = self._adata_manager.transfer_fields(adata)
-            self._register_manager_for_instance(adata_manager)
-
-        return adata_manager
-
-    # adjusted from scvi-tools
-    # https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-    # accessed on 22.April 2025
-    def _validate_anndata(self, adata: AnnData | None = None, copy_if_view: bool = True) -> AnnData:
-        """Validate anndata has been properly registered, transfer if necessary."""
-        if adata is None:
-            adata = self._adata
-
-        _check_if_view(adata, copy_if_view=copy_if_view)
-
-        adata_manager = self.get_anndata_manager(adata)
-        if adata_manager is None:
-            logger.info("Input AnnData not setup with scvi-tools. " + "attempting to transfer AnnData setup")
-            self._register_manager_for_instance(self._adata_manager.transfer_fields(adata))
-        else:
-            # Case where correct AnnDataManager is found, replay registration as necessary.
-            adata_manager.validate()
-
+        if adata.is_view:
+            adata._init_as_actual(adata.copy())
+        layer_key = self._cfg.dataset.layer_key
+        n_vars = adata.layers[layer_key].shape[1] if layer_key is not None else adata.n_vars
+        if n_vars != self.n_input:
+            raise ValueError(f"AnnData has {n_vars} features but the model was built for {self.n_input}.")
+        if list(map(str, adata.var_names)) != self.var_names:
+            raise ValueError("AnnData var_names differ from the ones the model was built with (names or order).")
         return adata
 
     def save_evaluation_results(
         self,
         adata: AnnData,
         prefix: str,
-        y_pred_local_df: pd.DataFrame,
-        y_pred_global_df: pd.DataFrame,
+        y_pred_local_df: pd.DataFrame | None = None,
+        y_pred_global_df: pd.DataFrame | None = None,
         local_embeddings_df: pd.DataFrame | None = None,
         global_embeddings_df: pd.DataFrame | None = None,
         attention_matrix_df: pd.DataFrame | None = None,
@@ -506,41 +242,6 @@ class BaseModel(metaclass=BaseModelMeta):
         else:
             raise ValueError(f"Global component {self._cfg.model.global_component.name} not found.")
 
-    def predict_nodewise(
-        self,
-        adata: AnnData | None = None,
-        indices: Sequence[int] | None = None,
-        batch_size: int | None = None,
-    ):
-        """Return cell label predictions.
-
-        Parameters
-        ----------
-        adata
-            AnnData object that has been registered via corresponding setup
-            method in model class.
-        indices
-            Indices of the data to predict. If None, all data is predicted.
-        """
-        if self.prediction_task == "regression":
-            raise ValueError("Prediction task is regression. Cannot predict nodewise labels.")
-        elif self.prediction_task == "classification" and self.prediction_level == "graph":
-            raise ValueError("Prediction level is graph. Cannot predict nodewise labels.")
-
-        if indices is None:
-            indices = np.arange(adata.n_obs)
-
-        scdl = self._make_data_loader(
-            adata=adata,
-            indices=indices,
-            batch_size=batch_size,
-        )
-
-        return None
-
-    # adjusted from scvi-tools
-    # https://github.com/scverse/scvi-tools/blob/main/src/scvi/model/base/_base_model.py
-    # accessed on 02.May 2025
     def save(
         self,
         dir_path: str | None = None,
@@ -594,16 +295,39 @@ class BaseModel(metaclass=BaseModelMeta):
         torch.save(
             {
                 SAVE_KEYS.MODEL_STATE_DICT_KEY: model_state_dict,
+                # What the model was built for, checked by `load` against the dataset it is given.
+                SAVE_KEYS.ATTR_DICT_KEY: {
+                    "n_input": self.n_input,
+                    "n_output": self.n_output,
+                    SAVE_KEYS.VAR_NAMES_KEY: self.var_names,
+                    "class_labels": self.class_labels,
+                },
             },
             model_save_path,
             **save_kwargs,
         )
 
+    def _check_saved_attrs(self, attrs: dict | None, path: str) -> None:
+        """Raise if a checkpoint was written for different genes or classes than ``self``."""
+        if attrs is None:
+            return  # written before the attrs were saved
+        saved = {
+            "var_names": attrs.get(SAVE_KEYS.VAR_NAMES_KEY),
+            "class_labels": attrs.get("class_labels"),
+        }
+        current = {"var_names": self.var_names, "class_labels": self.class_labels}
+        for key, value in saved.items():
+            if value is not None and list(value) != list(current[key] or []):
+                raise ValueError(
+                    f"{key} of the dataset do not match the ones checkpoint {path} was trained with "
+                    f"(names or order). The checkpoint's input/output columns would be misaligned."
+                )
+
     @classmethod
     def load(
         cls,
         dir_path: str,
-        adata: AnnData,
+        dataset: GraphDataset,
         cfg: CN,
         model_name: str | None = None,
         local_component: bool = False,
@@ -619,8 +343,10 @@ class BaseModel(metaclass=BaseModelMeta):
         ----------
         dir_path
             Path to saved model directory.
-        adata
-            AnnData object to load the model with.
+        dataset
+            Contract dataset to build the model from, normally the training split. Its
+            ``var_names`` and ``class_names`` must match the ones saved with the checkpoint
+            (checkpoints written before these were saved are not checked).
         cfg
             Configuration object.
         model_name: str | None
@@ -654,7 +380,7 @@ class BaseModel(metaclass=BaseModelMeta):
         model_save_path = os.path.join(dir_path, f"{file_name_prefix}{SAVE_KEYS.MODEL_FNAME}")
 
         # Initialize model
-        model = cls(adata, cfg)
+        model = cls(dataset, cfg)
 
         print(f"Loading model from {model_save_path}")
 
@@ -667,16 +393,15 @@ class BaseModel(metaclass=BaseModelMeta):
         else:
             map_location = torch.device("cpu")
 
-        if os.path.exists(model_save_path):
-            state_dict = torch.load(model_save_path, map_location=map_location)[SAVE_KEYS.MODEL_STATE_DICT_KEY]
-        else:
+        if not os.path.exists(model_save_path):
             print("Try with .ckpt extension.")
             model_save_path = model_save_path.replace(".pt", ".ckpt")
-            if os.path.exists(model_save_path):
-                state_dict = torch.load(model_save_path, map_location=map_location)[SAVE_KEYS.MODEL_STATE_DICT_KEY]
-            else:
+            if not os.path.exists(model_save_path):
                 print(f"Model file {model_save_path} not found.")
                 raise FileNotFoundError(f"Model file {model_save_path} not found.")
+        checkpoint = torch.load(model_save_path, map_location=map_location)
+        state_dict = checkpoint[SAVE_KEYS.MODEL_STATE_DICT_KEY]
+        model._check_saved_attrs(checkpoint.get(SAVE_KEYS.ATTR_DICT_KEY), model_save_path)
 
         # Apply remapping if enabled
         if enable_remapping:

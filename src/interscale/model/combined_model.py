@@ -3,6 +3,7 @@ import pandas as pd
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
+from interscale.data import GraphDataset
 from interscale.model.base._base_model import BaseModel
 from interscale.module import CombinedModule, DualDecoderCombinedModule
 from interscale.tl import prepare_a2d_dataset
@@ -16,10 +17,10 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
     def __init__(
         self,
-        adata: AnnData,
+        dataset: GraphDataset,
         cfg: CN,
     ):
-        super().__init__(adata, cfg)
+        super().__init__(dataset, cfg)
 
         self._module_kwargs = self._cfg.model
 
@@ -53,20 +54,21 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
         self._model_summary_string = self._model_summary_string + self.module.get_model_summary()
 
-    def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
+    def get_model_output(self, adata: AnnData, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.
 
         Parameters
         ----------
         adata
-            AnnData object to run the model on. If `None`, the model's AnnData object is used.
+            AnnData object to run the model on. Must have the genes the model was built with;
+            the outputs are written into it.
         prefix
             Prefix for the output columns.
         """
         if not self.is_trained_:
             raise RuntimeError("Please train the model first.")
 
-        adata = self._validate_anndata(adata)
+        adata = self._check_adata(adata)
 
         # Check for duplicate observation names
         adata.obs_names = [

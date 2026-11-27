@@ -39,8 +39,6 @@ def _build_datamodule(mask_strategy: str = "gene", mask_percentage: float = 0.4)
         mask_strategy=mask_strategy,
         learning_type="node",
     )
-    dm.setup(stage="fit")
-    dm.setup(stage="test")
     return dm
 
 
@@ -79,7 +77,7 @@ def test_sample_node_mask_masks_at_least_one_cell():
 def test_gene_strategy_writes_gene_mask_and_derives_node_mask():
     dm = _build_datamodule("gene")
 
-    for data in dm.train_data:
+    for data in dm.train_masked:
         assert data.gene_mask.shape == data.x.shape
         # Every cell is a supervision target under gene masking; selectivity moved to the entries.
         assert torch.equal(data.mask, data.gene_mask.any(dim=1))
@@ -89,7 +87,7 @@ def test_gene_strategy_writes_gene_mask_and_derives_node_mask():
 def test_node_strategy_leaves_no_gene_mask():
     dm = _build_datamodule("node")
 
-    for data in dm.train_data:
+    for data in dm.train_masked:
         assert "gene_mask" not in data
 
 
@@ -120,15 +118,14 @@ def test_gene_strategy_without_a_gene_mask_fails_loudly():
         apply_mask(data, "gene")
 
 
-def test_resample_redraws_the_gene_mask_in_place():
+def test_a_new_epoch_redraws_the_gene_mask_without_touching_the_stored_graph():
     dm = _build_datamodule("gene")
-    original = [data.gene_mask.clone() for data in dm.train_data]
-    ids = [id(data) for data in dm.train_data]
+    original = [data.gene_mask for data in dm.train_masked]
 
-    dm.resample_train_mask()
+    dm.set_epoch(1)
 
-    assert any(not torch.equal(o, d.gene_mask) for o, d in zip(original, dm.train_data))
-    assert [id(d) for d in dm.train_data] == ids
+    assert any(not torch.equal(o, d.gene_mask) for o, d in zip(original, dm.train_masked))
+    assert all("gene_mask" not in stored for stored in dm.train_data.data_list)
 
 
 def test_unmasked_split_gets_no_gene_mask():
@@ -140,9 +137,8 @@ def test_unmasked_split_gets_no_gene_mask():
         mask_strategy="gene",
         learning_type="graph",
     )
-    dm.setup(stage="fit")
 
-    for data in dm.val_data:
+    for data in dm.val_masked:
         assert "gene_mask" not in data
         assert not data.mask.any()
 

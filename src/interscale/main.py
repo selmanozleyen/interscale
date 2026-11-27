@@ -8,9 +8,10 @@ import squidpy as sq
 import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
+from interscale.data import build_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.pp import apply_segmentation_noise
-from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells, set_full_reproducibility
+from interscale.tl import remove_zero_expression_cells, set_full_reproducibility
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
 # FutureWarnings so they don't flood the training logs.
@@ -48,45 +49,25 @@ def main(cfg, model_type):
         sq.gr.spatial_neighbors(adata, **cfg.dataset.spatial_neigbors_kwargs)
         adata = apply_segmentation_noise(adata, node_fraction, overflow_fraction)
 
-    if model_type == "LocalModel":
-        interscale.model.LocalModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
+    datasets = build_graph_datasets(adata, cfg)
+    # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
+    # straight after the seeding above, whatever RNG the graph construction consumed.
+    set_full_reproducibility(cfg.optim.seed)
+    model_cls = {
+        "LocalModel": interscale.model.LocalModel,
+        "GlobalModel": interscale.model.GlobalModel,
+        "CombinedModel": interscale.model.CombinedModel,
+    }[model_type]
+    model = model_cls(datasets[0], cfg=cfg)
 
-        model = interscale.model.LocalModel(adata, cfg=cfg)
-    elif model_type == "GlobalModel":
-        interscale.model.GlobalModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
-
-        model = interscale.model.GlobalModel(adata, cfg=cfg)
-    elif model_type == "CombinedModel":
-        interscale.model.CombinedModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
-
-        model = interscale.model.CombinedModel(adata, cfg=cfg)
-
-    pyg_data_list, _ = prepare_geome_dataset(adata, cfg)
     dm = GraphAnnDataModule(
-        datas=pyg_data_list,
+        datas=datasets,
         num_workers=1,
         batch_size=int(cfg.dataset.batch_size),
         mask_percentage=cfg.dataset.mask_percentage,
         mask_strategy=cfg.dataset.mask_strategy,
         learning_type=cfg.dataset.prediction_level,
+        seed=cfg.optim.seed,
     )
 
     model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=cfg.optim.early_stopping)

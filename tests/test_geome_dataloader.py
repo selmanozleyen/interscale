@@ -1,6 +1,8 @@
 import torch
 from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 
+from interscale.data import InMemoryGraphDataset, MaskedGraphDataset
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.train._utils import NodeMaskResampleCallback
 
@@ -11,70 +13,96 @@ def _make_data(num_nodes: int, num_features: int = 3) -> Data:
     return Data(x=x, edge_index=edge_index)
 
 
-def _build_datamodule(mask_percentage: float = 0.5) -> GraphAnnDataModule:
+def _build_datamodule(mask_percentage: float = 0.5, learning_type: str = "node") -> GraphAnnDataModule:
     train_data = [_make_data(20), _make_data(20), _make_data(20)]
     val_data = [_make_data(10)]
     test_data = [_make_data(10)]
-    dm = GraphAnnDataModule(
+    return GraphAnnDataModule(
         datas=[train_data, val_data, test_data],
         batch_size=1,
         num_workers=0,
         mask_percentage=mask_percentage,
-        learning_type="node",
+        learning_type=learning_type,
     )
-    dm.setup(stage="fit")
-    dm.setup(stage="test")
-    return dm
 
 
-def test_resample_train_mask_changes_masked_nodes_without_replacing_objects():
-    """The masked node set must differ across calls, without cloning/replacing the `Data` objects."""
+def _masks(dataset) -> list[torch.Tensor]:
+    return [dataset[i].mask for i in range(len(dataset))]
+
+
+def test_plain_lists_are_wrapped_in_the_contract():
     dm = _build_datamodule()
-    original_masks = [data.mask.clone() for data in dm.train_data]
-    original_ids = [id(data) for data in dm.train_data]
-    original_list_id = id(dm.train_data)
 
-    changed = False
-    for _ in range(20):
-        dm.resample_train_mask()
-        if any(not torch.equal(orig, data.mask) for orig, data in zip(original_masks, dm.train_data)):
-            changed = True
-            break
-
-    assert changed, "resample_train_mask never produced a different mask across 20 redraws"
-    assert [id(data) for data in dm.train_data] == original_ids, "Data objects must be mutated in place, not replaced"
-    assert id(dm.train_data) == original_list_id, "train_data list must not be rebuilt"
+    assert isinstance(dm.train_data, InMemoryGraphDataset)
+    assert dm.train_data.num_node_features == 3
 
 
-def test_resample_train_mask_leaves_val_and_test_data_untouched():
+def test_train_mask_is_stable_within_an_epoch_and_changes_across_epochs():
     dm = _build_datamodule()
-    original_val_masks = [data.mask.clone() for data in dm.val_data]
-    original_test_masks = [data.mask.clone() for data in dm.test_data]
 
-    for _ in range(5):
-        dm.resample_train_mask()
+    epoch0 = _masks(dm.train_masked)
+    assert all(torch.equal(a, b) for a, b in zip(epoch0, _masks(dm.train_masked), strict=True))
 
-    for orig, data in zip(original_val_masks, dm.val_data):
-        assert torch.equal(orig, data.mask)
-    for orig, data in zip(original_test_masks, dm.test_data):
-        assert torch.equal(orig, data.mask)
+    dm.set_epoch(1)
+    epoch1 = _masks(dm.train_masked)
+    assert any(not torch.equal(a, b) for a, b in zip(epoch0, epoch1, strict=True))
 
-
-def test_resample_train_mask_is_noop_before_setup():
-    """Calling resample_train_mask before setup() must not raise (no dataloader exists yet)."""
-    dm = GraphAnnDataModule(datas=[[_make_data(20)], [_make_data(10)]], num_workers=0)
-
-    dm.resample_train_mask()
+    dm.set_epoch(0)
+    assert all(torch.equal(a, b) for a, b in zip(epoch0, _masks(dm.train_masked), strict=True))
 
 
-def test_node_mask_resample_callback_delegates_to_datamodule():
+def test_val_and_test_masks_do_not_depend_on_the_epoch():
     dm = _build_datamodule()
-    calls = []
-    dm.resample_train_mask = lambda: calls.append(1)
+    val, test = _masks(dm.val_masked), _masks(dm.test_masked)
+
+    for epoch in range(1, 5):
+        dm.set_epoch(epoch)
+        assert all(torch.equal(a, b) for a, b in zip(val, _masks(dm.val_masked), strict=True))
+        assert all(torch.equal(a, b) for a, b in zip(test, _masks(dm.test_masked), strict=True))
+
+
+def test_stored_graphs_are_never_mutated():
+    dm = _build_datamodule()
+    stored = dm.train_data.data_list[0]
+    x_before = stored.x.clone()
+
+    item = dm.train_masked[0]
+
+    assert "mask" not in stored
+    assert item is not stored
+    assert item.x.data_ptr() == stored.x.data_ptr(), "items must share the stored tensors, not copy them"
+    assert torch.equal(stored.x, x_before)
+
+
+def test_graph_level_eval_splits_are_not_masked():
+    dm = _build_datamodule(mask_percentage=0.5, learning_type="graph")
+
+    assert dm.train_masked[0].mask.any()
+    assert not dm.val_masked[0].mask.any()
+    assert not dm.test_masked[0].mask.any()
+
+
+def test_the_epoch_reaches_worker_processes():
+    """Workers get a pickled copy of the dataset when the epoch's iterator is created, so the
+    masks they draw must equal the ones drawn in the main process for the same epoch."""
+    graphs = [_make_data(30) for _ in range(6)]
+    masked = MaskedGraphDataset(InMemoryGraphDataset(graphs, var_names=["a", "b", "c"]), resample=True, seed=7)
+    masked.epoch = 3
+    expected = _masks(masked)
+
+    loader = DataLoader(masked, batch_size=1, shuffle=False, num_workers=2)
+    received = [batch.mask for batch in loader]
+
+    assert all(torch.equal(a, b) for a, b in zip(expected, received, strict=True))
+
+
+def test_node_mask_resample_callback_sets_the_trainer_epoch():
+    dm = _build_datamodule()
 
     class _StubTrainer:
         datamodule = dm
+        current_epoch = 4
 
     NodeMaskResampleCallback().on_train_epoch_start(_StubTrainer(), pl_module=None)
 
-    assert calls == [1]
+    assert dm.train_masked.epoch == 4

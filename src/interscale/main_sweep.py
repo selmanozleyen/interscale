@@ -14,9 +14,10 @@ import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_config, load_arms
+from interscale.data import build_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.pp.segmentation_noise import apply_segmentation_noise
-from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells, set_full_reproducibility
+from interscale.tl import remove_zero_expression_cells, set_full_reproducibility
 from interscale.tl.utils import get_model_filename_prefix
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
@@ -166,57 +167,29 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         sq.gr.spatial_neighbors(adata, **cfg.dataset.spatial_neigbors_kwargs)
         adata = apply_segmentation_noise(adata, cfg.dataset.segmentation_robustness)
 
-    if model_type == "LocalModel":
-        print_memory_usage("Before LocalModel setup")
-        interscale.model.LocalModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
-        print_memory_usage("After LocalModel setup")
+    print_memory_usage("Before build_graph_datasets")
+    datasets = build_graph_datasets(adata, cfg)
+    print_memory_usage("After build_graph_datasets")
 
-        model = interscale.model.LocalModel(adata, cfg=cfg)
-        print_memory_usage("After LocalModel creation")
-    elif model_type == "GlobalModel":
-        print_memory_usage("Before GlobalModel setup")
-        interscale.model.GlobalModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
-        print_memory_usage("After GlobalModel setup")
-
-        model = interscale.model.GlobalModel(adata, cfg=cfg)
-        print_memory_usage("After GlobalModel creation")
-    elif model_type == "CombinedModel":
-        print_memory_usage("Before CombinedModel setup")
-        interscale.model.CombinedModel._setup_anndata(
-            adata=adata,
-            prediction_task=cfg.dataset.prediction_task,
-            layer_key=cfg.dataset.layer_key,
-            sample_key_list=cfg.dataset.sample_key,
-            prediction_obs=cfg.dataset.prediction_obs,
-        )
-        print_memory_usage("After CombinedModel setup")
-
-        model = interscale.model.CombinedModel(adata, cfg=cfg)
-        print_memory_usage("After CombinedModel creation")
-
-    print_memory_usage("Before prepare_geome_dataset")
-    pyg_data_list, _ = prepare_geome_dataset(adata, cfg)
-    print_memory_usage("After prepare_geome_dataset")
+    # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
+    # straight after the seeding above, whatever RNG the graph construction consumed.
+    set_full_reproducibility(cfg.optim.seed)
+    model_cls = {
+        "LocalModel": interscale.model.LocalModel,
+        "GlobalModel": interscale.model.GlobalModel,
+        "CombinedModel": interscale.model.CombinedModel,
+    }[model_type]
+    model = model_cls(datasets[0], cfg=cfg)
+    print_memory_usage(f"After {model_type} creation")
 
     dm = GraphAnnDataModule(
-        datas=pyg_data_list,
+        datas=datasets,
         num_workers=1,
         batch_size=int(cfg.dataset.batch_size),
         mask_percentage=cfg.dataset.mask_percentage,
         mask_strategy=cfg.dataset.mask_strategy,
         learning_type=cfg.dataset.prediction_level,
+        seed=cfg.optim.seed,
     )
     print_memory_usage("After datamodule creation")
 
@@ -249,7 +222,7 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         # collection, not in attention, and nothing in the message said so.
         trial_error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
     finally:
-        del model, dm, pyg_data_list, adata
+        del model, dm, datasets, adata
         gc.collect()
         try:
             import torch

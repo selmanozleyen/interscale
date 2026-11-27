@@ -26,6 +26,23 @@ This is the main model class that can be used to define, train, and evaluate the
     model.LocalModel
 ```
 
+### Data contract
+
+Models are built from, and trained on, :class:`torch_geometric.data.Dataset` subclasses that follow a small contract: one graph per sample/window with `x [N, G]`, `edge_index` and, for classification, a one-hot `y [N, C]`, plus `var_names`, `class_names` and `label_counts()` as metadata. `build_graph_datasets` builds the in-memory implementation from an AnnData; any other storage that follows the contract trains the same models.
+
+```{eval-rst}
+.. currentmodule:: interscale
+
+.. autosummary::
+    :nosignatures:
+    :toctree: generated
+
+    data.GraphDataset
+    data.InMemoryGraphDataset
+    data.MaskedGraphDataset
+    data.build_graph_datasets
+```
+
 ### InterScale module
 
 InterScale is built from composable local and global modules. The combined modules wire them together into a full model. The base classes (`LocalModule`, `GlobalModule`) define the interface — subclass either to implement a custom architecture and pass it to any model class.
@@ -83,49 +100,36 @@ Two combined modules are available. `DualDecoderCombinedModule` is the default a
 ## Usage example
 
 ```
-import scanpy as sc
-from interscale
-from interscale.tl import prepare_geome_dataset
+import anndata as ad
+import interscale
+from interscale.config import load_config
+from interscale.data import build_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
 
 # Load your model and training configurations
 cfg = load_config(cfg_path)
 
-# Load your data
+# Load your data and build one graph per sample, split into train / val (/ test)
 adata = ad.read_h5ad("your_data.h5ad")
+datasets = build_graph_datasets(adata, cfg)
 
-# Setup anndata
-interscale.model.CombinedModel._setup_anndata(
-    adata = adata,
-    prediction_task = PREDICTION_TASK,
-    layer_key = "norm",
-    sample_key_list = ["sample"],
-    prediction_obs = prediction_obs
+# The model reads its input/output sizes and class names from the training split
+model = interscale.model.CombinedModel(datasets[0], cfg=cfg)
+
+dm = GraphAnnDataModule(
+    datas=datasets,
+    num_workers=1,
+    batch_size=int(cfg.dataset.batch_size),
+    mask_percentage=cfg.dataset.mask_percentage,
+    mask_strategy=cfg.dataset.mask_strategy,
+    learning_type=cfg.dataset.prediction_level,
+    seed=cfg.optim.seed,
 )
-
-# Initialize the model
-model = interscale.model.CombinedModel(
-    adata,
-    cfg = cfg
-)
-
-pyg_data_list, _ = prepare_geome_dataset(adata, cfg)
-dm = GraphAnnDataModule(datas=pyg_data_list,
-                        num_workers=1,
-                        batch_size=int(cfg.dataset.batch_size),
-                        pct_mask_nodes=cfg.dataset.pct_mask_nodes,
-                        learning_type="node")
 
 # Train the model
-model.train(max_epochs = 20,
-           datamodule = dm,
-           early_stopping = True,
-           batch_size = int(cfg.dataset.batch_size),
-           train_size = float(cfg.dataset.train_size),
-           validation_size = float(cfg.dataset.val_size),
-           wandb_use = False)
+model.train(max_epochs=20, datamodule=dm, early_stopping=True, wandb_use=False)
 
-# Get model output
+# Write embeddings, predictions and attention into the AnnData
 result = model.get_model_output(adata)
 
 # Please check tutorials for more details and downstream steps

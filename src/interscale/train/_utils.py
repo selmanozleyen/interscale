@@ -54,16 +54,20 @@ class PostWarmupEarlyStopping(EarlyStopping):
 
 
 class NodeMaskResampleCallback(Callback):
-    """Redraws the training node mask at the start of every epoch.
+    """Selects a fresh training mask at the start of every epoch.
 
-    Without this, `GraphAnnDataModule` only ever samples one fixed set of masked nodes for the
-    whole training run (see `GraphAnnDataModule.resample_train_mask`), so nodes outside that
-    initial sample never receive direct supervision. Validation/test masks are left untouched so
-    monitored metrics (e.g. `val_loss`) stay comparable across epochs.
+    Training masks are a function of ``(seed, epoch, graph)`` (see
+    :class:`interscale.data.MaskedGraphDataset`), so without advancing the epoch the same fixed
+    subset of nodes would be masked for the whole run and the rest would never receive direct
+    supervision. Validation/test masks do not depend on the epoch, so monitored metrics (e.g.
+    `val_loss`) stay comparable across epochs.
+
+    Lightning calls this hook before it creates the epoch's train iterator, so the new epoch is
+    pickled into freshly started workers.
     """
 
     def on_train_epoch_start(self, trainer, pl_module):
-        trainer.datamodule.resample_train_mask()
+        trainer.datamodule.set_epoch(trainer.current_epoch)
 
 
 class MetricsHistory(Callback):

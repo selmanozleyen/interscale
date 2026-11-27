@@ -10,7 +10,7 @@
 
 ![InterScale concept](docs/_static/img/InterScale_concept.png)
 
-InterScale is a package for cell interaction analysis in spatial transcriptomics data. It is build on top of PyG (via geome), AnnData, scanpy squidpy and scvi-tools.
+InterScale is a package for cell interaction analysis in spatial transcriptomics data. It is built on top of PyG (via geome), AnnData, scanpy and squidpy.
 
 ## Resources
 

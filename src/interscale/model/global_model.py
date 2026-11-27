@@ -5,6 +5,7 @@ from anndata import AnnData
 from torch.nn import functional as F
 from yacs.config import CfgNode as CN
 
+from interscale.data import GraphDataset
 from interscale.model.base._base_model import BaseModel
 from interscale.module.base import GlobalModule
 from interscale.tl import SelfAttentionRelevance, prepare_a2d_dataset
@@ -18,10 +19,10 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
 
     def __init__(
         self,
-        adata: AnnData,
+        dataset: GraphDataset,
         cfg: CN,
     ):
-        super().__init__(adata, cfg)
+        super().__init__(dataset, cfg)
 
         self._module_kwargs = self._cfg.model.global_component.parameters
 
@@ -44,20 +45,21 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         )
 
     # @torch.inference_mode() Not possible because of pytorch hook for self attention relevance
-    def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
+    def get_model_output(self, adata: AnnData, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.
 
         Parameters
         ----------
         adata
-            AnnData object to run the model on. If `None`, the model's AnnData object is used.
+            AnnData object to run the model on. Must have the genes the model was built with;
+            the outputs are written into it.
         prefix
             Prefix for the output columns.
         """
         if not self.is_trained_:
             raise RuntimeError("Please train the model first.")
 
-        adata = self._validate_anndata(adata)
+        adata = self._check_adata(adata)
 
         # Check for duplicate observation names
         adata.obs_names = [

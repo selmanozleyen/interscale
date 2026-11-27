@@ -18,6 +18,8 @@ figures/
 wandb/
 logs/
 data/
+# ...but not the package of that name
+!src/interscale/data/
 lightning_logs/
 artifacts/
 results/
