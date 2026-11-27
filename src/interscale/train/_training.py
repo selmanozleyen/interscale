@@ -283,8 +283,9 @@ class NodeMaskingTrainingPlan:
                 print(f"Best {performance_callback.monitor}: {performance_callback.best_score:.4f}")
 
         if self._cfg.model.save is not None:
-            print("Model checkpoint will be saved in: ", self._cfg.model.save + run_name + "model.ckpt")
-            trainer.save_checkpoint(self._cfg.model.save + run_name + "model.ckpt")
+            ckpt_path = os.path.join(self._cfg.model.save, run_name + "model.ckpt")
+            print("Model checkpoint will be saved in: ", ckpt_path)
+            trainer.save_checkpoint(ckpt_path)
             self.save(self._cfg.model.save)
 
         # Close WandB logger if it was used
