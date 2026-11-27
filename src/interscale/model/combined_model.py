@@ -6,14 +6,14 @@ from yacs.config import CfgNode as CN
 from interscale.data import GraphDataset
 from interscale.model.base._base_model import BaseModel
 from interscale.module import CombinedModule, DualDecoderCombinedModule
-from interscale.tl import prepare_a2d_dataset
 from interscale.train import NodeMaskingTrainingPlan
 
 
 class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
     """Combined model with both local and global components."""
 
-    _module_cls = CombinedModule
+    local_component = True
+    global_component = True
 
     def __init__(
         self,
@@ -21,37 +21,20 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
         cfg: CN,
     ):
         super().__init__(dataset, cfg)
-
-        self._module_kwargs = self._cfg.model
-
-        self.local_component = True
-        self.global_component = True
-        # Initialize the combined module with both local and global components
-        if self._cfg.model.decoder.dual_decoder:
-            self.module = DualDecoderCombinedModule(
-                cfg=self._cfg,
-                n_input=self.n_input,
-                n_output=self.n_output,
-                n_embed=self.n_embed,
-                decoder_type=None,  # Container doesn't need its own decoder, only submodules do
-                dropout_decoder=self._cfg.model.decoder.dropout_decoder,
-                decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
-                mask_percentage=self._cfg.dataset.mask_percentage,
-                mask_strategy=self._cfg.dataset.mask_strategy,
-            )
-        else:
-            self.module = CombinedModule(
-                cfg=self._cfg,
-                n_input=self.n_input,
-                n_output=self.n_output,
-                n_embed=self.n_embed,
-                decoder_type=None,  # Container doesn't need its own decoder, only global module does
-                dropout_decoder=self._cfg.model.decoder.dropout_decoder,
-                decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
-                mask_percentage=self._cfg.dataset.mask_percentage,
-                mask_strategy=self._cfg.dataset.mask_strategy,
-            )
-
+        # With dual_decoder, the local and global components each get their own decoder; the
+        # container itself never decodes.
+        module_cls = DualDecoderCombinedModule if cfg.model.decoder.dual_decoder else CombinedModule
+        self.module = module_cls(
+            cfg=cfg,
+            n_input=self.n_input,
+            n_output=self.n_output,
+            n_embed=self.n_embed,
+            decoder_type=None,
+            dropout_decoder=cfg.model.decoder.dropout_decoder,
+            decoder_hidden_dims=cfg.model.decoder.hidden_dims,
+            mask_percentage=cfg.dataset.mask_percentage,
+            mask_strategy=cfg.dataset.mask_strategy,
+        )
         self._model_summary_string = self._model_summary_string + self.module.get_model_summary()
 
     def get_model_output(self, adata: AnnData, prefix: str = ""):
@@ -65,31 +48,8 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
         prefix
             Prefix for the output columns.
         """
-        if not self.is_trained_:
-            raise RuntimeError("Please train the model first.")
-
-        adata = self._check_adata(adata)
-
-        # Check for duplicate observation names
-        adata.obs_names = [
-            str(i) for i in range(1, len(adata.obs_names) + 1)
-        ]  # ensure that no duplicate observation names are present
-        assert len(adata.obs_names) == len(adata.obs_names.unique()), (
-            f"Duplicate observation names found. Expected {len(adata.obs_names)} unique names but found {len(adata.obs_names.unique())}"
-        )
-
-        assert "spatial" in adata.obsm, "Missing spatial coordinates"
-        assert adata.obsm["spatial"].shape[0] > 0, "No spatial coordinates found"
-
-        a2d = prepare_a2d_dataset(self._cfg)
-        pyg, _ = list(a2d(adata))
-
-        obs_names_str = adata.obs_names.astype(int).astype(str)
-
-        # Check for duplicate observation names
-        assert len(obs_names_str) == len(obs_names_str.unique()), (
-            f"Duplicate observation names found. Expected {len(obs_names_str)} unique names but found {len(obs_names_str.unique())}"
-        )
+        adata, pyg = self._prepare_output(adata)
+        obs_names_str = adata.obs_names
 
         # Create empty DataFrame with correct shape
         local_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)

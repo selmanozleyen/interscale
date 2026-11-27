@@ -9,9 +9,7 @@ from anndata import AnnData
 from yacs.config import CfgNode as CN
 
 from interscale.data import GraphDataset
-from interscale.module.base import GlobalModule, LocalModule
-from interscale.module.global_modules import TransformerNodeEncoderHook
-from interscale.module.local_modules import GCN
+from interscale.tl.geome_utils import prepare_a2d_dataset
 from interscale.tl.utils import get_model_filename_prefix
 
 logger = logging.getLogger(__name__)
@@ -20,10 +18,8 @@ from typing import NamedTuple
 
 
 class _SAVE_KEYS_NT(NamedTuple):
-    ADATA_FNAME: str = "adata.h5ad"
     MODEL_FNAME: str = "model.pt"
     MODEL_STATE_DICT_KEY: str = "state_dict"
-    VAR_NAMES_KEY: str = "var_names"
     ATTR_DICT_KEY: str = "attr_dict"
 
 
@@ -33,6 +29,8 @@ SAVE_KEYS = _SAVE_KEYS_NT()
 # buffers were added after some checkpoints were written; `BaseModel.load` warns and carries on
 # for these, and raises for anything else. See tests/test_global_pca_persistence.py.
 _OPTIONAL_STATE_PREFIXES = ("pca_",)
+# Saved with a checkpoint and checked by `load` against the dataset it is given.
+_CKPT_ATTRS = ("var_names", "class_labels")
 
 
 class BaseModel(ABC):
@@ -49,6 +47,9 @@ class BaseModel(ABC):
     cfg
         The run config.
     """
+
+    local_component: bool = False
+    global_component: bool = False
 
     def __init__(self, dataset: GraphDataset, cfg: CN):
         self._cfg = cfg
@@ -74,9 +75,6 @@ class BaseModel(ABC):
         self.is_trained_ = False
         self._model_summary_string = f"{self.prediction_task} model for {self.prediction_level} prediction. \n"
         self.history_ = None
-
-        self.local_component = False
-        self.global_component = False
 
         self.class_weights = None
         if self._cfg.optim.loss == "WeightedCE":
@@ -107,21 +105,22 @@ class BaseModel(ABC):
         )
         return torch.as_tensor(weights, dtype=torch.float32)
 
-    def _check_adata(self, adata: AnnData) -> AnnData:
-        """Check ``adata`` against the model and make it writable for :meth:`get_model_output`.
+    def _prepare_output(self, adata: AnnData) -> tuple[AnnData, list]:
+        """Common start of ``get_model_output``: check ``adata`` and rebuild its graphs.
 
-        Raises unless ``adata`` has the genes the model was built for, in the same order. A view
-        is turned into an actual AnnData in place, since the output is written into it.
+        Raises unless the model is trained and ``adata`` has the model's genes in the same order.
+        A view is made actual in place, since outputs are written into it, and ``obs_names`` are
+        renumbered ``"1".."N"`` -- the ids the graphs carry in ``obs_names``.
         """
-        if adata.is_view:
-            adata._init_as_actual(adata.copy())
-        layer_key = self._cfg.dataset.layer_key
-        n_vars = adata.layers[layer_key].shape[1] if layer_key is not None else adata.n_vars
-        if n_vars != self.n_input:
-            raise ValueError(f"AnnData has {n_vars} features but the model was built for {self.n_input}.")
+        if not self.is_trained_:
+            raise RuntimeError("Please train the model first.")
         if list(map(str, adata.var_names)) != self.var_names:
             raise ValueError("AnnData var_names differ from the ones the model was built with (names or order).")
-        return adata
+        if adata.is_view:
+            adata._init_as_actual(adata.copy())
+        adata.obs_names = [str(i) for i in range(1, adata.n_obs + 1)]
+        graphs, _ = prepare_a2d_dataset(self._cfg)(adata)
+        return adata, graphs
 
     def save_evaluation_results(
         self,
@@ -181,67 +180,6 @@ class BaseModel(ABC):
     def train(self):
         """Trains the model."""
 
-    def _register_local_component(self) -> LocalModule:
-        """Register local component based on name.
-        Instance must be defined in InterScale.module.local_components.
-        """
-        if self._cfg.model.local_component.name == "GCN":
-            self._model_summary_string = self._model_summary_string + (
-                f"Local component {self._cfg.model.local_component.name}: "
-                f"n_layers: {self._cfg.model.local_component.parameters.num_layers},"
-                f"n_hidden: {self._cfg.model.local_component.parameters.hidden_dim},"
-                f"n_embed: {self.n_embed}, "
-                f"dropout_local: {self._cfg.model.local_component.parameters.dropout_local}"
-            )
-            return GCN(
-                n_input=self.n_input,
-                n_output=self.n_output,
-                n_embed=self.n_embed,
-                decoder_type=self._cfg.model.decoder.type,
-                dropout_decoder=self._cfg.model.decoder.dropout_decoder,
-                mask_percentage=self._cfg.dataset.mask_percentage,
-                mask_strategy=self._cfg.dataset.mask_strategy,
-                n_layers=self._cfg.model.local_component.parameters.num_layers,
-                hidden_dim=self._cfg.model.local_component.parameters.hidden_dim,
-                dropout_local=self._cfg.model.local_component.parameters.dropout_local,
-            )
-        else:
-            raise ValueError(f"Local component {self._cfg.local_component.name} not found.")
-
-    def _register_global_component(self) -> GlobalModule:
-        """Register global component based on name.
-        Instance must be defined in InterScale.module.global_components.
-        """
-        if self._cfg.model.global_component.name == "self-attn-transformer":
-            self._model_summary_string = self._model_summary_string + (
-                f"Global component {self._cfg.model.global_component.name}: "
-                f"max_seq_len: {self._cfg.model.global_component.parameters.max_seq_len},"
-                f"n_heads: {self._cfg.model.global_component.parameters.n_heads},"
-                f"dropout_global: {self._cfg.model.global_component.parameters.dropout_global},"
-                f"act_func: {self._cfg.model.global_component.parameters.activation_func},"
-                f"num_layers: {self._cfg.model.global_component.parameters.num_layers},"
-                f"dim_feedforward: {self._cfg.model.global_component.parameters.dim_feedforward},"
-                f"enforce long-range attention: {self._cfg.model.global_component.parameters.long_range_attention}"
-            )
-            return TransformerNodeEncoderHook(
-                n_input=self.n_input,
-                n_output=self.n_output,
-                n_embed=self.n_embed,
-                decoder_type=self._cfg.model.decoder.type,
-                dropout_decoder=self._cfg.model.decoder.dropout_decoder,
-                mask_percentage=self._cfg.dataset.mask_percentage,
-                mask_strategy=self._cfg.dataset.mask_strategy,
-                max_seq_len=self._cfg.model.global_component.parameters.max_seq_len,
-                n_heads=self._cfg.model.global_component.parameters.n_heads,
-                dropout_global=self._cfg.model.global_component.parameters.dropout_global,
-                act_func=self._cfg.model.global_component.parameters.activation_func,
-                num_layers=self._cfg.model.global_component.parameters.num_layers,
-                dim_feedforward=self._cfg.model.global_component.parameters.dim_feedforward,
-                long_range_attention=self._cfg.model.global_component.parameters.long_range_attention,
-            )
-        else:
-            raise ValueError(f"Global component {self._cfg.model.global_component.name} not found.")
-
     def save(
         self,
         dir_path: str | None = None,
@@ -295,13 +233,7 @@ class BaseModel(ABC):
         torch.save(
             {
                 SAVE_KEYS.MODEL_STATE_DICT_KEY: model_state_dict,
-                # What the model was built for, checked by `load` against the dataset it is given.
-                SAVE_KEYS.ATTR_DICT_KEY: {
-                    "n_input": self.n_input,
-                    "n_output": self.n_output,
-                    SAVE_KEYS.VAR_NAMES_KEY: self.var_names,
-                    "class_labels": self.class_labels,
-                },
+                SAVE_KEYS.ATTR_DICT_KEY: {key: getattr(self, key) for key in _CKPT_ATTRS},
             },
             model_save_path,
             **save_kwargs,
@@ -309,15 +241,9 @@ class BaseModel(ABC):
 
     def _check_saved_attrs(self, attrs: dict | None, path: str) -> None:
         """Raise if a checkpoint was written for different genes or classes than ``self``."""
-        if attrs is None:
-            return  # written before the attrs were saved
-        saved = {
-            "var_names": attrs.get(SAVE_KEYS.VAR_NAMES_KEY),
-            "class_labels": attrs.get("class_labels"),
-        }
-        current = {"var_names": self.var_names, "class_labels": self.class_labels}
-        for key, value in saved.items():
-            if value is not None and list(value) != list(current[key] or []):
+        for key in _CKPT_ATTRS:
+            saved = (attrs or {}).get(key)  # checkpoints before the attrs were saved have none
+            if saved is not None and list(saved) != list(getattr(self, key) or []):
                 raise ValueError(
                     f"{key} of the dataset do not match the ones checkpoint {path} was trained with "
                     f"(names or order). The checkpoint's input/output columns would be misaligned."
@@ -330,8 +256,8 @@ class BaseModel(ABC):
         dataset: GraphDataset,
         cfg: CN,
         model_name: str | None = None,
-        local_component: bool = False,
-        global_component: bool = False,
+        local_component: bool | None = None,
+        global_component: bool | None = None,
         postfix: str | None = None,
         wandb_save: bool = False,
         enable_remapping: bool = True,
@@ -351,10 +277,8 @@ class BaseModel(ABC):
             Configuration object.
         model_name: str | None
             Name of the model to load. If None, the model name is inferred from the config file.
-        local_component
-            Whether this is a local component model.
-        global_component
-            Whether this is a global component model.
+        local_component, global_component
+            Which components the checkpoint's filename names; default to the class's own.
         wandb_save
             Whether this was saved via wandb.
         allow_partial_load
@@ -372,7 +296,11 @@ class BaseModel(ABC):
         if model_name is not None:
             file_name_prefix = model_name
         else:
-            file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
+            file_name_prefix = get_model_filename_prefix(
+                cfg,
+                cls.local_component if local_component is None else local_component,
+                cls.global_component if global_component is None else global_component,
+            )
 
         if postfix is not None:
             file_name_prefix = file_name_prefix + f"{postfix}"

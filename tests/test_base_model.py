@@ -1,130 +1,26 @@
 """Models are built from the PyG data contract (`interscale.data`), not from an AnnData registry."""
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
-from anndata import AnnData
-from torch_geometric.data import Data
 
-from interscale.config import load_config
 from interscale.data import InMemoryGraphDataset, build_graph_datasets
 from interscale.model.local_model import LocalModel
 from interscale.tl import prepare_geome_dataset
 
-GENES = [f"g{i}" for i in range(5)]
+GENES = [f"g{i}" for i in range(6)]
 CLASSES = ["A", "B", "C"]
 
 
 @pytest.fixture
-def components_yaml(tmp_path):
-    # Component names select which component defaults load_config merges, so they have to come
-    # from a file rather than from overrides.
-    path = tmp_path / "components.yaml"
-    path.write_text("model:\n  local_component:\n    name: GCN\n  global_component:\n    name: self-attn-transformer\n")
-    return path
-
-
-def _cfg(components_yaml, tmp_path, *, task="classification", level="node", loss="WeightedCE"):
-    overrides = [
-        "dataset.sample_key", ["sample"],
-        "dataset.prediction_task", task,
-        "dataset.prediction_level", level,
-        "dataset.name", "unit",
-        "optim.loss", loss,
-        "model.n_embed", 4,
-        "model.save", str(tmp_path / "models"),
-        "wandb.use", False,
-    ]  # fmt: skip
-    if task == "classification":
-        overrides += ["dataset.prediction_obs", "ct"]
-    if level == "graph":
-        overrides += ["dataset.mask_percentage", 0.0]  # _validate_masking: graph tasks are unmasked
-    return load_config(components_yaml, overrides=overrides)
-
-
-def _graph(labels: list[int], n_genes: int = len(GENES), n_classes: int = len(CLASSES)) -> Data:
-    n = len(labels)
-    return Data(
-        x=torch.randn(n, n_genes),
-        edge_index=torch.zeros((2, 0), dtype=torch.long),
-        y=torch.nn.functional.one_hot(torch.tensor(labels), n_classes).float(),
-    )
-
-
-def _classification_dataset() -> InMemoryGraphDataset:
-    # graph 0: majority A; graph 1: majority C; graph 2: majority A
-    graphs = [_graph([0, 0, 1]), _graph([2, 2, 2, 1]), _graph([0, 1, 0, 0, 2])]
+def classification_dataset(make_graph):
+    # Graph majorities: A, C, A.
+    graphs = [
+        make_graph(3, labels=[0, 0, 1]),
+        make_graph(4, labels=[2, 2, 2, 1]),
+        make_graph(5, labels=[0, 1, 0, 0, 2]),
+    ]
     return InMemoryGraphDataset(graphs, var_names=GENES, class_names=CLASSES)
-
-
-def _spatial_adata(seed: int = 0) -> AnnData:
-    rng = np.random.default_rng(seed)
-    samples = ["s1", "s2", "s3", "s4"]
-    n_per = 15
-    n = n_per * len(samples)
-    adata = AnnData(X=rng.random((n, len(GENES)), dtype=np.float32))
-    adata.var_names = GENES
-    adata.obsm["spatial"] = rng.uniform(0, 100, size=(n, 2))
-    adata.obs["sample"] = pd.Categorical(np.repeat(samples, n_per))
-    adata.obs["split"] = pd.Categorical(np.repeat(["train", "train", "val", "test"], n_per))
-    adata.obs["ct"] = pd.Categorical(rng.choice(CLASSES, size=n))
-    return adata
-
-
-# ----------------------------------------------------------------------- contract metadata
-
-
-def test_model_reads_dimensions_and_classes_from_the_dataset(components_yaml, tmp_path):
-    model = LocalModel(_classification_dataset(), _cfg(components_yaml, tmp_path, loss="CrossEntropy"))
-
-    assert model.n_input == len(GENES)
-    assert model.n_output == len(CLASSES)
-    assert model.class_labels == CLASSES
-    assert model.var_names == GENES
-    assert model.class_weights is None
-
-
-def test_regression_model_outputs_every_gene(components_yaml, tmp_path):
-    graphs = [Data(x=torch.randn(4, len(GENES)), edge_index=torch.zeros((2, 0), dtype=torch.long))]
-    dataset = InMemoryGraphDataset(graphs, var_names=GENES)
-    model = LocalModel(dataset, _cfg(components_yaml, tmp_path, task="regression", loss="MSELoss"))
-
-    assert model.n_input == model.n_output == len(GENES)
-    assert model.class_labels is None
-
-
-def test_classification_needs_class_names(components_yaml, tmp_path):
-    dataset = InMemoryGraphDataset([_graph([0, 1])], var_names=GENES)  # no class_names
-
-    with pytest.raises(ValueError, match="class_names"):
-        LocalModel(dataset, _cfg(components_yaml, tmp_path, loss="CrossEntropy"))
-
-
-def test_num_classes_does_not_load_the_graphs():
-    """PyG's default `num_classes` loads every graph -- a full pass over an on-disk dataset."""
-
-    class _Exploding(InMemoryGraphDataset):
-        def get(self, idx):
-            raise AssertionError("metadata must not touch the data")
-
-    dataset = _Exploding([_graph([0])], var_names=GENES, class_names=CLASSES)
-
-    assert dataset.num_classes == len(CLASSES)
-    assert dataset.num_node_features == len(GENES)
-
-
-def test_in_memory_dataset_rejects_a_y_that_does_not_match_class_names():
-    with pytest.raises(ValueError, match="one-hot y"):
-        InMemoryGraphDataset([_graph([0, 1], n_classes=2)], var_names=GENES, class_names=CLASSES)
-
-
-def test_in_memory_dataset_rejects_mismatched_var_names():
-    with pytest.raises(ValueError, match="features"):
-        InMemoryGraphDataset([_graph([0])], var_names=GENES[:-1], class_names=CLASSES)
-
-
-# --------------------------------------------------------------------------- class weights
 
 
 def _balanced(counts):
@@ -132,106 +28,134 @@ def _balanced(counts):
     return counts.sum() / (len(counts) * counts)  # sklearn's compute_class_weight("balanced")
 
 
-def test_node_level_weights_count_cells(components_yaml, tmp_path):
-    model = LocalModel(_classification_dataset(), _cfg(components_yaml, tmp_path, level="node"))
+# ----------------------------------------------------------------------- contract metadata
+
+
+def test_model_reads_dimensions_and_classes_from_the_dataset(make_cfg, classification_dataset):
+    model = LocalModel(classification_dataset, make_cfg())
+
+    assert (model.n_input, model.n_output) == (len(GENES), len(CLASSES))
+    assert model.class_labels == CLASSES
+    assert model.var_names == GENES
+    assert model.class_weights is None
+
+
+def test_regression_model_outputs_every_gene(make_cfg, make_graph):
+    model = LocalModel(InMemoryGraphDataset([make_graph(4)], var_names=GENES), make_cfg(task="regression"))
+
+    assert model.n_input == model.n_output == len(GENES)
+    assert model.class_labels is None
+
+
+def test_classification_needs_class_names(make_cfg, make_graph):
+    with pytest.raises(ValueError, match="class_names"):
+        LocalModel(InMemoryGraphDataset([make_graph(2, labels=[0, 1])], var_names=GENES), make_cfg())
+
+
+def test_num_classes_does_not_load_the_graphs(make_graph):
+    """PyG's default `num_classes` loads every graph -- a full pass over an on-disk dataset."""
+
+    class _Exploding(InMemoryGraphDataset):
+        def get(self, idx):
+            raise AssertionError("metadata must not touch the data")
+
+    dataset = _Exploding([make_graph(1, labels=[0])], var_names=GENES, class_names=CLASSES)
+
+    assert (dataset.num_classes, dataset.num_node_features) == (len(CLASSES), len(GENES))
+
+
+def test_in_memory_dataset_validates_widths_against_metadata(make_graph):
+    with pytest.raises(ValueError, match="one-hot y"):
+        InMemoryGraphDataset([make_graph(2, labels=[0, 1])], var_names=GENES, class_names=CLASSES[:2])
+    with pytest.raises(ValueError, match="features"):
+        InMemoryGraphDataset([make_graph(1, labels=[0])], var_names=GENES[:-1], class_names=CLASSES)
+
+
+# --------------------------------------------------------------------------- class weights
+
+
+def test_node_level_weights_count_cells(make_cfg, classification_dataset):
+    model = LocalModel(classification_dataset, make_cfg(loss="WeightedCE"))
 
     # cells: A = 2 + 0 + 3, B = 1 + 1 + 1, C = 0 + 3 + 1
     np.testing.assert_allclose(model.class_weights.numpy(), _balanced([5, 3, 4]), rtol=1e-6)
 
 
-def test_graph_level_weights_count_graphs_by_majority_label(components_yaml, tmp_path):
-    dataset = InMemoryGraphDataset(
-        [_graph([0, 0, 1]), _graph([2, 2, 1]), _graph([0, 0, 2]), _graph([1, 1, 0])],  # A, C, A, B
-        var_names=GENES,
-        class_names=CLASSES,
-    )
-    model = LocalModel(dataset, _cfg(components_yaml, tmp_path, level="graph"))
+def test_graph_level_weights_count_graphs_by_majority_label(make_cfg, make_graph, classification_dataset):
+    labels = [[0, 0, 1], [2, 2, 1], [0, 0, 2], [1, 1, 0]]  # majorities A, C, A, B
+    dataset = InMemoryGraphDataset([make_graph(3, labels=y) for y in labels], var_names=GENES, class_names=CLASSES)
+    cfg = make_cfg(level="graph", loss="WeightedCE")
 
-    np.testing.assert_allclose(model.class_weights.numpy(), _balanced([2, 1, 1]), rtol=1e-6)
-
-
-def test_weights_fail_loudly_when_a_class_has_no_training_unit(components_yaml, tmp_path):
-    # Graph majorities are A, C, A: no graph is a B, so graph-level WeightedCE is undefined.
+    np.testing.assert_allclose(LocalModel(dataset, cfg).class_weights.numpy(), _balanced([2, 1, 1]), rtol=1e-6)
+    # classification_dataset's majorities are A, C, A: no B graph, so the weights are undefined.
     with pytest.raises(ValueError, match="no training units"):
-        LocalModel(_classification_dataset(), _cfg(components_yaml, tmp_path, level="graph"))
+        LocalModel(classification_dataset, cfg)
 
 
-def test_weights_match_the_previous_obs_based_computation(components_yaml, tmp_path):
+def test_weights_match_the_previous_obs_based_computation(make_cfg, make_spatial_adata):
     """Same numbers as the AnnData-based weights this replaces: train-split cells per class."""
-    adata = _spatial_adata()
-    cfg = _cfg(components_yaml, tmp_path)
-    train_ct = adata.obs.loc[adata.obs["split"] == "train", "ct"].astype(str)
-    counts = train_ct.value_counts().reindex(CLASSES).to_numpy(dtype=np.float64)
-    expected = counts.sum() / (len(CLASSES) * counts)
+    adata = make_spatial_adata()
+    cfg = make_cfg(loss="WeightedCE")
+    counts = adata.obs.loc[adata.obs["split"] == "train", "ct"].astype(str).value_counts().reindex(CLASSES)
 
-    datasets = build_graph_datasets(adata, cfg)
-    model = LocalModel(datasets[0], cfg)
+    model = LocalModel(build_graph_datasets(adata, cfg)[0], cfg)
 
-    np.testing.assert_allclose(model.class_weights.numpy(), expected, rtol=1e-6)
+    np.testing.assert_allclose(model.class_weights.numpy(), _balanced(counts), rtol=1e-6)
 
 
 # --------------------------------------------------------------------------- build from AnnData
 
 
-def test_build_graph_datasets_wraps_prepare_geome_dataset(components_yaml, tmp_path):
-    cfg = _cfg(components_yaml, tmp_path)
+def test_build_graph_datasets_wraps_prepare_geome_dataset(make_cfg, make_spatial_adata):
+    cfg = make_cfg()
 
-    datasets = build_graph_datasets(_spatial_adata(), cfg)
-    reference, _ = prepare_geome_dataset(_spatial_adata(), cfg)
+    datasets = build_graph_datasets(make_spatial_adata(), cfg)
+    reference, _ = prepare_geome_dataset(make_spatial_adata(), cfg)
 
-    assert [len(d) for d in datasets] == [len(r) for r in reference] == [2, 1, 1]
+    assert [len(d) for d in datasets] == [len(r) for r in reference] == [3, 1, 1]
     for dataset, graphs in zip(datasets, reference, strict=True):
-        assert dataset.var_names == GENES
-        assert dataset.class_names == CLASSES
+        assert (dataset.var_names, dataset.class_names) == (GENES, CLASSES)
         for i, graph in enumerate(graphs):
-            assert torch.equal(dataset[i].x, graph.x)
-            assert torch.equal(dataset[i].edge_index, graph.edge_index)
-            assert torch.equal(dataset[i].y, graph.y)
+            for key in ("x", "edge_index", "y"):
+                assert torch.equal(dataset[i][key], graph[key])
 
 
 # ----------------------------------------------------------------------------- save / load
 
 
-def test_save_load_round_trip_and_metadata_check(components_yaml, tmp_path):
-    cfg = _cfg(components_yaml, tmp_path, loss="CrossEntropy")
-    dataset = _classification_dataset()
-    model = LocalModel(dataset, cfg)
+def test_save_load_round_trip_and_metadata_check(make_cfg, classification_dataset):
+    cfg = make_cfg()
+    model = LocalModel(classification_dataset, cfg)
     model.save()
 
-    loaded = LocalModel.load(cfg.model.save, dataset, cfg, local_component=True)
+    loaded = LocalModel.load(cfg.model.save, classification_dataset, cfg)
     for key, value in model.module.state_dict().items():
         assert torch.equal(value, loaded.module.state_dict()[key])
 
-    reordered = InMemoryGraphDataset(dataset.data_list, var_names=GENES[::-1], class_names=CLASSES)
+    graphs = classification_dataset.data_list
     with pytest.raises(ValueError, match="var_names"):
-        LocalModel.load(cfg.model.save, reordered, cfg, local_component=True)
-
-    relabelled = InMemoryGraphDataset(dataset.data_list, var_names=GENES, class_names=["A", "C", "B"])
+        LocalModel.load(cfg.model.save, InMemoryGraphDataset(graphs, GENES[::-1], CLASSES), cfg)
     with pytest.raises(ValueError, match="class_labels"):
-        LocalModel.load(cfg.model.save, relabelled, cfg, local_component=True)
+        LocalModel.load(cfg.model.save, InMemoryGraphDataset(graphs, GENES, ["A", "C", "B"]), cfg)
 
 
-def test_checkpoint_without_saved_metadata_still_loads(components_yaml, tmp_path):
+def test_checkpoint_without_saved_metadata_still_loads(make_cfg, classification_dataset, tmp_path):
     """Checkpoints written before the metadata was saved carry only the state dict."""
     from interscale.model.base._base_model import SAVE_KEYS
-    from interscale.tl.utils import get_model_filename_prefix
 
-    cfg = _cfg(components_yaml, tmp_path, loss="CrossEntropy")
-    dataset = _classification_dataset()
-    model = LocalModel(dataset, cfg)
-    model.save()
-    path = tmp_path / "models" / f"{get_model_filename_prefix(cfg, True, False)}{SAVE_KEYS.MODEL_FNAME}"
-    checkpoint = torch.load(path)
-    torch.save({SAVE_KEYS.MODEL_STATE_DICT_KEY: checkpoint[SAVE_KEYS.MODEL_STATE_DICT_KEY]}, path)
+    cfg = make_cfg()
+    LocalModel(classification_dataset, cfg).save()
+    (path,) = (tmp_path / "models").glob(f"*{SAVE_KEYS.MODEL_FNAME}")
+    state = torch.load(path)[SAVE_KEYS.MODEL_STATE_DICT_KEY]
+    torch.save({SAVE_KEYS.MODEL_STATE_DICT_KEY: state}, path)
 
-    LocalModel.load(cfg.model.save, dataset, cfg, local_component=True)
+    LocalModel.load(cfg.model.save, classification_dataset, cfg)
 
 
-def test_get_model_output_rejects_an_adata_with_other_genes(components_yaml, tmp_path):
-    cfg = _cfg(components_yaml, tmp_path, loss="CrossEntropy")
-    model = LocalModel(_classification_dataset(), cfg)
+def test_get_model_output_rejects_an_adata_with_other_genes(make_cfg, classification_dataset, make_spatial_adata):
+    model = LocalModel(classification_dataset, make_cfg())
     model.is_trained_ = True
-    adata = _spatial_adata()
+    adata = make_spatial_adata()
     adata.var_names = [f"other{i}" for i in range(len(GENES))]
 
     with pytest.raises(ValueError, match="var_names"):

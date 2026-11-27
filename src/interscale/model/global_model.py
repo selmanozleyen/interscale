@@ -2,20 +2,18 @@ import numpy as np
 import pandas as pd
 import torch
 from anndata import AnnData
-from torch.nn import functional as F
 from yacs.config import CfgNode as CN
 
 from interscale.data import GraphDataset
 from interscale.model.base._base_model import BaseModel
 from interscale.module.base import GlobalModule
-from interscale.tl import SelfAttentionRelevance, prepare_a2d_dataset
 from interscale.train._training import NodeMaskingTrainingPlan
 
 
 class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
     """Global model with only global component."""
 
-    _module_cls = GlobalModule
+    global_component = True
 
     def __init__(
         self,
@@ -23,14 +21,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         cfg: CN,
     ):
         super().__init__(dataset, cfg)
-
-        self._module_kwargs = self._cfg.model.global_component.parameters
-
-        self.local_component = False
-        self.global_component = True
-
-        # self.module = self._register_global_component()
-
         self.module = GlobalModule.from_config(
             cfg,
             n_input=self.n_input,
@@ -56,23 +46,8 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         prefix
             Prefix for the output columns.
         """
-        if not self.is_trained_:
-            raise RuntimeError("Please train the model first.")
-
-        adata = self._check_adata(adata)
-
-        # Check for duplicate observation names
-        adata.obs_names = [
-            str(i) for i in range(1, len(adata.obs_names) + 1)
-        ]  # ensure that no duplicate observation names are present
-        assert len(adata.obs_names) == len(adata.obs_names.unique()), (
-            f"Duplicate observation names found. Expected {len(adata.obs_names)} unique names but found {len(adata.obs_names.unique())}"
-        )
-
-        a2d = prepare_a2d_dataset(self._cfg)
-        pyg, _ = list(a2d(adata))
-
-        obs_names_str = adata.obs_names.astype(int).astype(str)
+        adata, pyg = self._prepare_output(adata)
+        obs_names_str = adata.obs_names
 
         # Create empty DataFrame with correct shape
         global_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)
@@ -86,7 +61,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
 
         cls_token_horizontal = np.full(len(adata.obs_names), np.nan)
         cls_token_vertical = np.full(len(adata.obs_names), np.nan)
-        self_attention_relevance = SelfAttentionRelevance(self.module)
 
         for batch in pyg:
             if hasattr(batch, "embeddings"):
@@ -102,9 +76,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             # no masking during evaluation
             y_pred = self.module.predict(global_embedding, src_padding_mask, self.prediction_level)
 
-            cosine_sim = F.cosine_similarity(batch.x, y_pred, dim=1)
-
-            # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)
             batch_obs_names_str = batch.obs_names.numpy().astype(int).astype(str)[pad_index_nodes[0]]
             sample_mask = global_embeddings_df.index.isin(batch_obs_names_str)
             global_embeddings_df.loc[sample_mask] = global_embedding[:-1].squeeze(1).detach().cpu().numpy()
@@ -124,8 +95,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         adata = self.save_evaluation_results(
             adata,
             prefix,
-            # decoder_weight_df = decoder_weight_df,
-            y_pred_local_df=None,
             y_pred_global_df=y_pred_df,
             global_embeddings_df=global_embeddings_df,
             attention_matrix_df=attention_matrix_df,

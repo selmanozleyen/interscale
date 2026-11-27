@@ -11,9 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torchmetrics
-from torch_geometric.data import Data
 
-from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.tl.masking import (
     MASK_VALUE,
     apply_mask,
@@ -22,25 +20,6 @@ from interscale.tl.masking import (
     sample_node_mask,
 )
 from interscale.train._trainingplans import RunningCosineSimilarity, masked_regression_metrics
-
-
-def _make_data(num_nodes: int, num_features: int = 6) -> Data:
-    x = torch.randn(num_nodes, num_features)
-    edge_index = torch.zeros((2, 0), dtype=torch.long)
-    return Data(x=x, edge_index=edge_index)
-
-
-def _build_datamodule(mask_strategy: str = "gene", mask_percentage: float = 0.4) -> GraphAnnDataModule:
-    dm = GraphAnnDataModule(
-        datas=[[_make_data(20), _make_data(20)], [_make_data(10)], [_make_data(10)]],
-        batch_size=1,
-        num_workers=0,
-        mask_percentage=mask_percentage,
-        mask_strategy=mask_strategy,
-        learning_type="node",
-    )
-    return dm
-
 
 # --------------------------------------------------------------------------- mask sampling
 
@@ -74,8 +53,8 @@ def test_sample_node_mask_masks_at_least_one_cell():
 # ------------------------------------------------------------------------------- datamodule
 
 
-def test_gene_strategy_writes_gene_mask_and_derives_node_mask():
-    dm = _build_datamodule("gene")
+def test_gene_strategy_writes_gene_mask_and_derives_node_mask(make_datamodule):
+    dm = make_datamodule(n_features=6, mask_strategy="gene", mask_percentage=0.4)
 
     for data in dm.train_masked:
         assert data.gene_mask.shape == data.x.shape
@@ -84,21 +63,21 @@ def test_gene_strategy_writes_gene_mask_and_derives_node_mask():
         assert data.mask.all()
 
 
-def test_node_strategy_leaves_no_gene_mask():
-    dm = _build_datamodule("node")
+def test_node_strategy_leaves_no_gene_mask(make_datamodule):
+    dm = make_datamodule(n_features=6, mask_strategy="node", mask_percentage=0.4)
 
     for data in dm.train_masked:
         assert "gene_mask" not in data
 
 
-def test_a_stale_gene_mask_cannot_hijack_the_node_strategy():
+def test_a_stale_gene_mask_cannot_hijack_the_node_strategy(make_graph):
     """The strategy is a parameter, so a leftover attribute is simply ignored.
 
     This is why the dataloader has no `_clear_gene_mask`: correctness comes from telling
     `apply_mask` (and `_process_batch_for_metrics`) which strategy is configured, not from
     scrubbing the attribute they used to sniff.
     """
-    data = _make_data(12)
+    data = make_graph(12)
     data.gene_mask = sample_gene_mask(12, data.x.shape[1], pct=0.5)  # stale, from a gene run
     data.mask = sample_node_mask(12, pct=0.5)
 
@@ -110,16 +89,16 @@ def test_a_stale_gene_mask_cannot_hijack_the_node_strategy():
     assert torch.equal(out.x[~data.mask], data.x[~data.mask])
 
 
-def test_gene_strategy_without_a_gene_mask_fails_loudly():
-    data = _make_data(8)
+def test_gene_strategy_without_a_gene_mask_fails_loudly(make_graph):
+    data = make_graph(8)
     data.mask = sample_node_mask(8, pct=0.5)
 
     with pytest.raises(AssertionError, match="no gene_mask"):
         apply_mask(data, "gene")
 
 
-def test_a_new_epoch_redraws_the_gene_mask_without_touching_the_stored_graph():
-    dm = _build_datamodule("gene")
+def test_a_new_epoch_redraws_the_gene_mask_without_touching_the_stored_graph(make_datamodule):
+    dm = make_datamodule(n_features=6, mask_strategy="gene", mask_percentage=0.4)
     original = [data.gene_mask for data in dm.train_masked]
 
     dm.set_epoch(1)
@@ -128,31 +107,25 @@ def test_a_new_epoch_redraws_the_gene_mask_without_touching_the_stored_graph():
     assert all("gene_mask" not in stored for stored in dm.train_data.data_list)
 
 
-def test_unmasked_split_gets_no_gene_mask():
+def test_unmasked_split_gets_no_gene_mask(make_datamodule):
     """Graph-level eval splits pass mask=False and must not be corrupted."""
-    dm = GraphAnnDataModule(
-        datas=[[_make_data(20)], [_make_data(10)], [_make_data(10)]],
-        batch_size=1,
-        num_workers=0,
-        mask_strategy="gene",
-        learning_type="graph",
-    )
+    dm = make_datamodule(mask_strategy="gene", learning_type="graph")
 
     for data in dm.val_masked:
         assert "gene_mask" not in data
         assert not data.mask.any()
 
 
-def test_invalid_strategy_is_rejected():
+def test_invalid_strategy_is_rejected(make_datamodule):
     with pytest.raises(ValueError, match="mask_strategy"):
-        GraphAnnDataModule(datas=[[_make_data(4)], [_make_data(4)]], mask_strategy="cell")
+        make_datamodule(mask_strategy="cell")
 
 
 # ----------------------------------------------------------------------------- apply_mask
 
 
-def test_apply_mask_gene_path_blanks_only_the_masked_entries():
-    data = _make_data(12)
+def test_apply_mask_gene_path_blanks_only_the_masked_entries(make_graph):
+    data = make_graph(12)
     data.gene_mask = sample_gene_mask(12, data.x.shape[1], pct=0.4)
     data.mask = data.gene_mask.any(dim=1)
 
@@ -166,8 +139,8 @@ def test_apply_mask_gene_path_blanks_only_the_masked_entries():
     assert not torch.equal(out.x, data.x)
 
 
-def test_apply_mask_node_path_is_unchanged():
-    data = _make_data(12)
+def test_apply_mask_node_path_is_unchanged(make_graph):
+    data = make_graph(12)
     data.mask = sample_node_mask(12, pct=0.5)
 
     out, mask_idx, entry_mask = apply_mask(data, "node")
@@ -360,9 +333,9 @@ def test_mask_value_is_outside_the_range_of_a_log1p_layer():
     assert MASK_VALUE < 0
 
 
-def test_masked_positions_are_distinguishable_from_real_zeros():
+def test_masked_positions_are_distinguishable_from_real_zeros(make_graph):
     """The regression this guards: with a 0 fill, `x == MASK_VALUE` would also select real zeros."""
-    data = _make_data(200, num_features=6)
+    data = make_graph(200, n_features=6)
     # ~60% exact zeros, as in the real layer.
     data.x = (torch.rand(200, 6) > 0.6).float() * torch.rand(200, 6)
     data.gene_mask = sample_gene_mask(200, 6, pct=0.3)
@@ -374,9 +347,9 @@ def test_masked_positions_are_distinguishable_from_real_zeros():
     assert torch.equal(out.x == MASK_VALUE, entry_mask)
 
 
-def test_all_zero_cells_stay_distinguishable_from_masked_cells():
+def test_all_zero_cells_stay_distinguishable_from_masked_cells(make_graph):
     """legnini23 has 648 cells whose expression is entirely zero, so an all-zero row is real data."""
-    data = _make_data(10, num_features=6)
+    data = make_graph(10, n_features=6)
     data.x = torch.zeros(10, 6)
     data.mask = sample_node_mask(10, pct=0.5)
 

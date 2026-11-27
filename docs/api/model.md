@@ -47,17 +47,16 @@ Models are built from, and trained on, :class:`torch_geometric.data.Dataset` sub
     data.load_graph_datasets
 ```
 
-For data that does not fit in memory, write the graphs once to a zarr store and train from it; each training step then reads only the graphs in its batch:
+For data that does not fit in memory, write the graphs once to a zarr store and train from it. Given a file path, the writer reads only each graph's rows; training then reads only the graphs in each batch:
 
 ```
 from interscale.data import open_graph_store, write_graph_store
 
-write_graph_store(adata, cfg, "graphs.zarr")  # adata may be backed: ad.read_h5ad(path, backed="r")
+write_graph_store("data.h5ad", cfg, "graphs.zarr", drop_zero_expression=True)
 datasets = open_graph_store("graphs.zarr", cfg)  # same contract as build_graph_datasets
-model = interscale.model.CombinedModel(datasets[0], cfg=cfg)
 ```
 
-From the command line, set `dataset.graph_store` to a directory: the first run writes the store for its config there, and later runs with the same graph-building settings train from it without reading `h5ad_data`.
+From the command line, set `dataset.graph_store` to a directory and `main.py` does both steps.
 
 ### InterScale module
 
@@ -132,15 +131,7 @@ datasets = build_graph_datasets(adata, cfg)
 # The model reads its input/output sizes and class names from the training split
 model = interscale.model.CombinedModel(datasets[0], cfg=cfg)
 
-dm = GraphAnnDataModule(
-    datas=datasets,
-    num_workers=1,
-    batch_size=int(cfg.dataset.batch_size),
-    mask_percentage=cfg.dataset.mask_percentage,
-    mask_strategy=cfg.dataset.mask_strategy,
-    learning_type=cfg.dataset.prediction_level,
-    seed=cfg.optim.seed,
-)
+dm = GraphAnnDataModule.from_cfg(datasets, cfg)
 
 # Train the model
 model.train(max_epochs=20, datamodule=dm, early_stopping=True, wandb_use=False)

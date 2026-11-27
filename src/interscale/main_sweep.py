@@ -2,25 +2,17 @@ import argparse
 import gc
 import os
 import traceback
-import warnings
 
 import psutil
 import wandb
 import yaml
 
-import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_config, load_arms
-from interscale.data import load_graph_datasets
-from interscale.geome_dataloader import GraphAnnDataModule
-from interscale.tl import set_full_reproducibility
+from interscale.main import build_run  # also installs main's warning filters
+from interscale.model import MODEL_CLASSES
 from interscale.tl.utils import get_model_filename_prefix
-
-# geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
-# FutureWarnings so they don't flood the training logs.
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*spatial_neighbors.*")
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*n_neighs.*")
 
 
 def print_memory_usage(stage=""):
@@ -39,28 +31,6 @@ def print_memory_usage(stage=""):
             print(f"[GPU MEMORY] {stage}: Allocated: {gpu_allocated:.2f} GB, Reserved: {gpu_reserved:.2f} GB")
     except ImportError:
         pass
-
-
-def print_memory_debug():
-    """Debug function to see what's consuming memory"""
-    try:
-        import gc
-
-        # Get object counts by type
-        objects = gc.get_objects()
-        type_counts = {}
-        for obj in objects:
-            obj_type = type(obj).__name__
-            type_counts[obj_type] = type_counts.get(obj_type, 0) + 1
-
-        # Print top memory consumers
-        print("\n[MEMORY DEBUG] Top object types:")
-        sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
-        for obj_type, count in sorted_types[:10]:
-            print(f"  {obj_type}: {count} objects")
-
-    except (RuntimeError, TypeError, ValueError) as e:
-        print(f"Memory debug failed: {e}")
 
 
 def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None):
@@ -93,92 +63,51 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
 
     assert cfg.wandb.use, "Wandb is not enabled in the configuration file. Necessary for sweep."
 
-    local_component = False
-    global_component = False
-
-    if model_type == "LocalModel" or model_type == "CombinedModel":
-        local_component = True
-    if model_type == "GlobalModel" or model_type == "CombinedModel":
-        global_component = True
+    local_component = MODEL_CLASSES[model_type].local_component
+    global_component = MODEL_CLASSES[model_type].global_component
 
     file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
 
-    if cfg.wandb.use:
-        print("Wandb initialize...")
-        sweep_run = wandb.init(
-            project=cfg.wandb.project_name, config=cfg, name=file_name_prefix, job_type="model_training"
-        )
-        sweep_config = wandb.config
+    print("Wandb initialize...")
+    sweep_run = wandb.init(project=cfg.wandb.project_name, config=cfg, name=file_name_prefix, job_type="model_training")
+    sweep_config = wandb.config
 
-    # Update configuration with sweep parameters
-    if sweep_config is not None:
-        print("sweep config: ", sweep_config)
-        print("sweep run: ", sweep_run.config)
-        # Applies whatever dotted keys the sweep declares, and raises if any of them does not
-        # exist in the config rather than letting it vary between trials with no effect.
-        cfg, _applied = apply_sweep_config(
-            cfg,
-            sweep_goal,
-            sweep_config,
-            model_type=model_type,
-            sweep_params=sweep_params,
-            arms=arms,
-        )
-
-        # The name above was derived from the config BEFORE the trial was applied, so every run
-        # of a sweep that varies dataset.name or optim.seed -- both of which feed the prefix, and
-        # through it the checkpoint filename -- appeared under one identical name. Renaming here
-        # makes a run's name the name of the checkpoint it wrote, which is what an analysis
-        # loading models back out of the sweep has to match on.
-        file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
-        if sweep_run.name != file_name_prefix:
-            print(f"renaming run: {sweep_run.name} -> {file_name_prefix}")
-            sweep_run.name = file_name_prefix
-        # Recorded as plain summary keys so the wandb API can be filtered on them without
-        # re-deriving anything from the nested config blob.
-        sweep_run.summary["checkpoint_prefix"] = file_name_prefix
-        sweep_run.summary["resolved_dataset_name"] = cfg.dataset.name
-        sweep_run.summary["resolved_sample_key"] = list(cfg.dataset.sample_key)
-        sweep_run.summary["resolved_seed"] = cfg.optim.seed
-        # `parameters` is only added to the schema for a model type that HAS a global component,
-        # so a LocalModel sweep must not touch it.
-        if global_component:
-            sweep_run.summary["resolved_max_seq_len"] = cfg.model.global_component.parameters.max_seq_len
-        sweep_run.summary["resolved_model_save"] = cfg.model.save
-
-    # Seed BEFORE the model is built, with the trial's own seed (i.e. after apply_sweep_config).
-    # train() calls seed_everything too, but only after __init__ has already drawn the initial
-    # weights, so without this the init was unseeded: two runs of an identical config started
-    # from different weights (chen22: best val_f1_macro 0.89 vs 0.30), and optim.seed did not
-    # reproduce a trial. main.py has always seeded here; with it, repeated runs are bit-identical.
-    set_full_reproducibility(cfg.optim.seed)
-
-    ####### PREPROCESSING #######
-    print_memory_usage("Before load_graph_datasets")
-    datasets = load_graph_datasets(cfg)
-    print_memory_usage("After load_graph_datasets")
-
-    # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
-    # straight after the seeding above, whatever RNG the graph construction consumed.
-    set_full_reproducibility(cfg.optim.seed)
-    model_cls = {
-        "LocalModel": interscale.model.LocalModel,
-        "GlobalModel": interscale.model.GlobalModel,
-        "CombinedModel": interscale.model.CombinedModel,
-    }[model_type]
-    model = model_cls(datasets[0], cfg=cfg)
-    print_memory_usage(f"After {model_type} creation")
-
-    dm = GraphAnnDataModule(
-        datas=datasets,
-        num_workers=1,
-        batch_size=int(cfg.dataset.batch_size),
-        mask_percentage=cfg.dataset.mask_percentage,
-        mask_strategy=cfg.dataset.mask_strategy,
-        learning_type=cfg.dataset.prediction_level,
-        seed=cfg.optim.seed,
+    print("sweep config: ", sweep_config)
+    print("sweep run: ", sweep_run.config)
+    # Applies whatever dotted keys the sweep declares, and raises if any of them does not
+    # exist in the config rather than letting it vary between trials with no effect.
+    cfg, _applied = apply_sweep_config(
+        cfg,
+        sweep_goal,
+        sweep_config,
+        model_type=model_type,
+        sweep_params=sweep_params,
+        arms=arms,
     )
-    print_memory_usage("After datamodule creation")
+
+    # The name above was derived from the config BEFORE the trial was applied, so every run
+    # of a sweep that varies dataset.name or optim.seed -- both of which feed the prefix, and
+    # through it the checkpoint filename -- appeared under one identical name. Renaming here
+    # makes a run's name the name of the checkpoint it wrote, which is what an analysis
+    # loading models back out of the sweep has to match on.
+    file_name_prefix = get_model_filename_prefix(cfg, local_component, global_component)
+    if sweep_run.name != file_name_prefix:
+        print(f"renaming run: {sweep_run.name} -> {file_name_prefix}")
+        sweep_run.name = file_name_prefix
+    # Recorded as plain summary keys so the wandb API can be filtered on them without
+    # re-deriving anything from the nested config blob.
+    sweep_run.summary["checkpoint_prefix"] = file_name_prefix
+    sweep_run.summary["resolved_dataset_name"] = cfg.dataset.name
+    sweep_run.summary["resolved_sample_key"] = list(cfg.dataset.sample_key)
+    sweep_run.summary["resolved_seed"] = cfg.optim.seed
+    # `parameters` is only added to the schema for a model type that HAS a global component,
+    # so a LocalModel sweep must not touch it.
+    if global_component:
+        sweep_run.summary["resolved_max_seq_len"] = cfg.model.global_component.parameters.max_seq_len
+    sweep_run.summary["resolved_model_save"] = cfg.model.save
+
+    model, dm = build_run(cfg, model_type)
+    print_memory_usage(f"After building the {model_type} run")
 
     # wandb.agent runs every trial of a sweep inside ONE process, so anything still holding CUDA
     # tensors when a trial ends stays resident and the next trial starts with less GPU memory
@@ -209,7 +138,7 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         # collection, not in attention, and nothing in the message said so.
         trial_error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
     finally:
-        del model, dm, datasets
+        del model, dm
         gc.collect()
         try:
             import torch
@@ -247,7 +176,7 @@ if __name__ == "__main__":
         dest="model_type",
         type=str,
         default=None,
-        choices=["LocalModel", "GlobalModel", "CombinedModel"],
+        choices=list(MODEL_CLASSES),
         help="The model type: LocalModel, GlobalModel or CombinedModel.",
     )
     parser.add_argument(

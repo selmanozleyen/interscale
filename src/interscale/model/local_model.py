@@ -7,14 +7,13 @@ from yacs.config import CfgNode as CN
 from interscale.data import GraphDataset
 from interscale.model.base._base_model import BaseModel
 from interscale.module.base import LocalModule
-from interscale.tl.geome_utils import prepare_a2d_dataset
 from interscale.train._training import NodeMaskingTrainingPlan
 
 
 class LocalModel(NodeMaskingTrainingPlan, BaseModel):
     """Local model with only local component."""
 
-    _module_cls = LocalModule
+    local_component = True
 
     def __init__(
         self,
@@ -22,10 +21,6 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
         cfg: CN,
     ):
         super().__init__(dataset, cfg)
-
-        self.local_component = True
-        self.global_component = False
-
         self.module = LocalModule.from_config(
             cfg,
             n_input=self.n_input,
@@ -50,23 +45,8 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
         prefix
             Prefix for the output columns.
         """
-        if not self.is_trained_:
-            raise RuntimeError("Please train the model first.")
-
-        adata = self._check_adata(adata)
-
-        # Check for duplicate observation names
-        adata.obs_names = [
-            str(i) for i in range(1, len(adata.obs_names) + 1)
-        ]  # ensure that no duplicate observation names are present
-        assert len(adata.obs_names) == len(adata.obs_names.unique()), (
-            f"Duplicate observation names found. Expected {len(adata.obs_names)} unique names but found {len(adata.obs_names.unique())}"
-        )
-
-        a2d = prepare_a2d_dataset(self._cfg)
-        pyg, _ = list(a2d(adata))
-
-        obs_names_str = adata.obs_names.astype(int).astype(str)
+        adata, pyg = self._prepare_output(adata)
+        obs_names_str = adata.obs_names
 
         # Create empty DataFrame with correct shape
         local_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)

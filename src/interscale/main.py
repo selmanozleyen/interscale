@@ -2,17 +2,26 @@ import argparse
 import warnings
 from pathlib import Path
 
-import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.data import load_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
+from interscale.model import MODEL_CLASSES
 from interscale.tl import set_full_reproducibility
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
 # FutureWarnings so they don't flood the training logs.
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*spatial_neighbors.*")
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*n_neighs.*")
+
+
+def build_run(cfg, model_type: str, num_workers: int = 1):
+    """The model and datamodule of a training run: what ``main`` and ``main_sweep`` train."""
+    set_full_reproducibility(cfg.optim.seed)  # graph construction may draw (segmentation noise)
+    datasets = load_graph_datasets(cfg)
+    set_full_reproducibility(cfg.optim.seed)  # so the initial weights depend only on optim.seed
+    model = MODEL_CLASSES[model_type](datasets[0], cfg=cfg)
+    return model, GraphAnnDataModule.from_cfg(datasets, cfg, num_workers=num_workers)
 
 
 def main(cfg, model_type):
@@ -30,29 +39,8 @@ def main(cfg, model_type):
     if isinstance(cfg, str | Path):
         cfg = load_config(cfg)
 
-    set_full_reproducibility(cfg.optim.seed)
     print(cfg)
-    datasets = load_graph_datasets(cfg)
-    # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
-    # straight after the seeding above, whatever RNG the graph construction consumed.
-    set_full_reproducibility(cfg.optim.seed)
-    model_cls = {
-        "LocalModel": interscale.model.LocalModel,
-        "GlobalModel": interscale.model.GlobalModel,
-        "CombinedModel": interscale.model.CombinedModel,
-    }[model_type]
-    model = model_cls(datasets[0], cfg=cfg)
-
-    dm = GraphAnnDataModule(
-        datas=datasets,
-        num_workers=1,
-        batch_size=int(cfg.dataset.batch_size),
-        mask_percentage=cfg.dataset.mask_percentage,
-        mask_strategy=cfg.dataset.mask_strategy,
-        learning_type=cfg.dataset.prediction_level,
-        seed=cfg.optim.seed,
-    )
-
+    model, dm = build_run(cfg, model_type)
     model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=cfg.optim.early_stopping)
 
 
@@ -74,7 +62,7 @@ if __name__ == "__main__":
         dest="model_type",
         type=str,
         default=None,
-        choices=["LocalModel", "GlobalModel", "CombinedModel"],
+        choices=list(MODEL_CLASSES),
         help="The model type: LocalModel, GlobalModel or CombinedModel.",
     )
     args = parser.parse_args()

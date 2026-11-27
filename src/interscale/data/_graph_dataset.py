@@ -9,8 +9,8 @@ A model needs exactly three things from its data, and all of them are on the dat
 Everything else is an ordinary :class:`torch_geometric.data.Dataset`: ``len()`` graphs, and
 ``get(i)`` returning one :class:`~torch_geometric.data.Data` per sample/window with ``x [N, G]``,
 ``edge_index [2, E]`` and, for classification, a one-hot ``y [N, C]``. Any storage that satisfies
-this -- the in-memory list built from an AnnData today, an on-disk store later -- can train any
-InterScale model, and the model never sees where the graphs came from.
+this -- :class:`InMemoryGraphDataset` or the on-disk :class:`~interscale.data.ZarrGraphDataset` --
+can train any InterScale model, which never sees where the graphs came from.
 
 Masking is deliberately *not* part of the contract. :class:`MaskedGraphDataset` wraps any
 contract dataset and draws the corruption per item from a seeded generator, so a stored graph is
@@ -35,8 +35,7 @@ from interscale.tl.masking import MASK_STRATEGIES, sample_gene_mask, sample_node
 class GraphDataset(PygDataset):
     """Base class for the datasets InterScale models train on.
 
-    Subclasses implement :meth:`len`, :meth:`get` and :meth:`label_counts`; everything the
-    model reads is derived from those and from the metadata passed here.
+    Subclasses implement :meth:`len`, :meth:`get` and :meth:`_class_counts`.
 
     Parameters
     ----------
@@ -48,14 +47,12 @@ class GraphDataset(PygDataset):
     """
 
     def __init__(self, var_names: Sequence[str], class_names: Sequence[str] | None = None):
-        # No root/transform: InterScale datasets are built, not downloaded, and the masking that
-        # would otherwise be a transform lives in MaskedGraphDataset.
         super().__init__(root=None)
         self.var_names = [str(v) for v in var_names]
         self.class_names = None if class_names is None else [str(c) for c in class_names]
 
-    # PyG's defaults read data from disk to answer these: ``num_node_features`` loads ``self[0]``
-    # and ``num_classes`` loads *every* graph to collect the labels. Both are metadata here.
+    # PyG's defaults read data to answer these: ``num_node_features`` loads ``self[0]`` and
+    # ``num_classes`` loads *every* graph. Both are metadata here.
     @property
     def num_node_features(self) -> int:
         return len(self.var_names)
@@ -63,6 +60,10 @@ class GraphDataset(PygDataset):
     @property
     def num_classes(self) -> int:
         return 0 if self.class_names is None else len(self.class_names)
+
+    def _class_counts(self) -> np.ndarray:
+        """Cells per class per graph, ``[len(self), num_classes]``."""
+        raise NotImplementedError
 
     def label_counts(self, level: Literal["node", "graph"]) -> np.ndarray:
         """Per-class number of training units, ordered like :attr:`class_names`.
@@ -77,7 +78,14 @@ class GraphDataset(PygDataset):
         np.ndarray
             Float64 array of shape ``[num_classes]``.
         """
-        raise NotImplementedError
+        if self.class_names is None:
+            raise ValueError("label_counts needs class_names; this is a regression dataset.")
+        per_graph = np.asarray(self._class_counts(), dtype=np.float64).reshape(-1, self.num_classes)
+        if level == "node":
+            return per_graph.sum(axis=0)
+        if level == "graph":
+            return np.bincount(per_graph.argmax(axis=1), minlength=self.num_classes).astype(np.float64)
+        raise ValueError(f"level must be 'node' or 'graph', got {level!r}")
 
 
 class InMemoryGraphDataset(GraphDataset):
@@ -106,7 +114,7 @@ class InMemoryGraphDataset(GraphDataset):
                 raise ValueError(
                     f"graph {i} has {data.x.shape[1]} features but {self.num_node_features} var_names were given"
                 )
-            y = getattr(data, "y", None)
+            y = data.y
             if self.class_names is not None and (y is None or y.dim() != 2 or y.shape[1] != self.num_classes):
                 shape = None if y is None else tuple(y.shape)
                 raise ValueError(
@@ -119,19 +127,8 @@ class InMemoryGraphDataset(GraphDataset):
     def get(self, idx: int) -> Data:
         return self.data_list[idx]
 
-    def label_counts(self, level: Literal["node", "graph"]) -> np.ndarray:
-        if self.class_names is None:
-            raise ValueError("label_counts needs class_names; this is a regression dataset.")
-        counts = np.zeros(self.num_classes, dtype=np.float64)
-        for data in self.data_list:
-            per_class = data.y.sum(dim=0).double().cpu().numpy()
-            if level == "node":
-                counts += per_class
-            elif level == "graph":
-                counts[int(per_class.argmax())] += 1
-            else:
-                raise ValueError(f"level must be 'node' or 'graph', got {level!r}")
-        return counts
+    def _class_counts(self) -> np.ndarray:
+        return [data.y.sum(dim=0).double().numpy() for data in self.data_list]
 
 
 class MaskedGraphDataset(TorchDataset):
@@ -144,11 +141,11 @@ class MaskedGraphDataset(TorchDataset):
       :class:`~interscale.train._utils.NodeMaskResampleCallback`) while val/test masks stay fixed
       and monitored metrics remain comparable across epochs;
     - the result does not depend on ``num_workers``: each worker receives a pickled copy of this
-      object when the epoch's iterator is created, ``epoch`` included. Do not combine with
-      ``persistent_workers=True``, which would keep the first epoch's copy.
+      object when the epoch's iterator is created, ``epoch`` included. This is why InterScale's
+      loaders never use ``persistent_workers=True``, which would keep the first epoch's copy.
 
-    Each item is a shallow copy of the stored graph, so the stored tensors are shared and the
-    stored :class:`~torch_geometric.data.Data` object itself is never written to.
+    Each item is a shallow copy of the stored graph: tensors are shared, the stored
+    :class:`~torch_geometric.data.Data` is never written to.
 
     Parameters
     ----------
@@ -199,19 +196,15 @@ class MaskedGraphDataset(TorchDataset):
 
     def __getitem__(self, idx: int) -> Data:
         data = copy.copy(self.dataset[idx])
+        if "gene_mask" in data:
+            del data.gene_mask
         if not self.enabled:
             data.mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-            if "gene_mask" in data:
-                del data.gene_mask
-            return data
-
-        generator = self._generator(idx)
-        if self.mask_strategy == "gene":
-            gene_mask = sample_gene_mask(data.num_nodes, data.x.shape[1], self.mask_percentage, generator=generator)
-            data.gene_mask = gene_mask
-            data.mask = gene_mask.any(dim=1)
+        elif self.mask_strategy == "gene":
+            data.gene_mask = sample_gene_mask(
+                data.num_nodes, data.x.shape[1], self.mask_percentage, self._generator(idx)
+            )
+            data.mask = data.gene_mask.any(dim=1)
         else:
-            data.mask = sample_node_mask(data.num_nodes, self.mask_percentage, generator=generator)
-            if "gene_mask" in data:
-                del data.gene_mask
+            data.mask = sample_node_mask(data.num_nodes, self.mask_percentage, self._generator(idx))
         return data

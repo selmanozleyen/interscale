@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import partial
 from typing import Literal
 
 import lightning.pytorch as pl
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+from yacs.config import CfgNode as CN
 
 from interscale.data import GraphDataset, InMemoryGraphDataset, MaskedGraphDataset
-from interscale.tl.masking import MASK_STRATEGIES
-
-VALID_STAGE = {"fit", "test", "validate", None}
-VALID_SPLIT = {"node", "graph"}
 
 
 def _as_graph_dataset(datas: GraphDataset | Sequence[Data]) -> GraphDataset:
@@ -24,33 +22,22 @@ def _as_graph_dataset(datas: GraphDataset | Sequence[Data]) -> GraphDataset:
 
 
 class GraphAnnDataModule(pl.LightningDataModule):
-    """Lightning DataModule over InterScale contract datasets.
+    """Lightning DataModule over InterScale contract datasets, masked by :class:`~interscale.data.MaskedGraphDataset`.
 
     Parameters
     ----------
     datas
         ``[train, val]`` or ``[train, val, test]``, each a :class:`~interscale.data.GraphDataset`
-        (or a plain list of :class:`~torch_geometric.data.Data`, wrapped in an
-        :class:`~interscale.data.InMemoryGraphDataset`).
+        or a plain list of :class:`~torch_geometric.data.Data`.
     batch_size
-        Number of graphs per batch.
+        Graphs per batch.
     num_workers
-        DataLoader worker processes. Workers are re-created every epoch (no persistent workers),
-        which is how the epoch reaches the mask draw; see :class:`~interscale.data.MaskedGraphDataset`.
-    mask_percentage
-        Bernoulli masking probability, per cell under ``mask_strategy="node"`` and per
-        (cell, gene) entry under ``"gene"``.
-    mask_strategy
-        Granularity of the corruption. ``"node"`` blanks whole cells (loss over all G genes of the
-        masked cells); ``"gene"`` blanks individual (cell, gene) entries in every cell (loss over
-        those entries only). See :mod:`interscale.tl.masking`.
+        DataLoader worker processes, re-created every epoch (see ``MaskedGraphDataset``).
+    mask_percentage, mask_strategy, seed
+        Passed to :class:`~interscale.data.MaskedGraphDataset`.
     learning_type
-        ``"node"`` or ``"graph"``. For node-level learning the masked nodes *are* the
-        supervision/evaluation targets, so every split is masked. For graph-level learning masking
-        is pure input augmentation, so only train is masked.
-    seed
-        Base seed of the mask draws. Train masks are a function of ``(seed, epoch, graph)``,
-        val/test masks of ``(seed, graph)``.
+        ``"node"`` masks every split, since the masked nodes are the targets. ``"graph"`` masks
+        only train, where masking is input augmentation.
     """
 
     def __init__(
@@ -66,45 +53,34 @@ class GraphAnnDataModule(pl.LightningDataModule):
         super().__init__()
         if datas is None or len(datas) not in (2, 3):
             raise ValueError("datas must hold a train and a validation set, and optionally a test set.")
-        if learning_type not in VALID_SPLIT:
-            raise ValueError("Learning type must be one of %r." % VALID_SPLIT)
-        if mask_strategy not in MASK_STRATEGIES:
-            raise ValueError("mask_strategy must be one of %r." % (MASK_STRATEGIES,))
-
-        self.train_data = _as_graph_dataset(datas[0])
-        self.val_data = _as_graph_dataset(datas[1])
-        self.test_data = _as_graph_dataset(datas[2]) if len(datas) == 3 else None
-
+        if learning_type not in ("node", "graph"):
+            raise ValueError(f"learning_type must be 'node' or 'graph', got {learning_type!r}.")
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.mask_percentage = mask_percentage
-        self.mask_strategy = mask_strategy
-        self.learning_type = learning_type
-        self.seed = seed
 
+        self.train_data, self.val_data, *rest = map(_as_graph_dataset, datas)
+        self.test_data = rest[0] if rest else None
+        masked = partial(MaskedGraphDataset, mask_strategy=mask_strategy, mask_percentage=mask_percentage, seed=seed)
         eval_mask = learning_type == "node"
-        self.train_masked = self._masked(self.train_data, enabled=True, resample=True)
-        self.val_masked = self._masked(self.val_data, enabled=eval_mask, resample=False)
-        self.test_masked = (
-            None if self.test_data is None else self._masked(self.test_data, enabled=eval_mask, resample=False)
-        )
+        self.train_masked = masked(self.train_data, resample=True)
+        self.val_masked = masked(self.val_data, enabled=eval_mask)
+        self.test_masked = None if self.test_data is None else masked(self.test_data, enabled=eval_mask)
 
-    def _masked(self, dataset: GraphDataset, *, enabled: bool, resample: bool) -> MaskedGraphDataset:
-        return MaskedGraphDataset(
-            dataset,
-            mask_strategy=self.mask_strategy,
-            mask_percentage=self.mask_percentage,
-            enabled=enabled,
-            resample=resample,
-            seed=self.seed,
+    @classmethod
+    def from_cfg(cls, datas: Sequence[GraphDataset], cfg: CN, num_workers: int = 1) -> GraphAnnDataModule:
+        """The datamodule a training run with ``cfg`` uses."""
+        return cls(
+            datas,
+            batch_size=int(cfg.dataset.batch_size),
+            num_workers=num_workers,
+            mask_percentage=cfg.dataset.mask_percentage,
+            mask_strategy=cfg.dataset.mask_strategy,
+            learning_type=cfg.dataset.prediction_level,
+            seed=cfg.optim.seed,
         )
-
-    def setup(self, stage: str | None = None):
-        if stage not in VALID_STAGE:
-            raise ValueError("Stage must be one of %r." % VALID_STAGE)
 
     def set_epoch(self, epoch: int) -> None:
-        """Select the training masks for ``epoch``. Takes effect at the next train iterator."""
+        """Select the training masks for ``epoch``; takes effect at the next train iterator."""
         self.train_masked.epoch = int(epoch)
 
     def _loader(self, dataset: MaskedGraphDataset, shuffle: bool) -> DataLoader:
