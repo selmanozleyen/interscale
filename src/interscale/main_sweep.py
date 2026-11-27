@@ -5,8 +5,6 @@ import traceback
 import warnings
 
 import psutil
-import scanpy as sc
-import squidpy as sq
 import wandb
 import yaml
 
@@ -14,10 +12,9 @@ import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_config, load_arms
-from interscale.data import build_graph_datasets
+from interscale.data import load_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
-from interscale.pp.segmentation_noise import apply_segmentation_noise
-from interscale.tl import remove_zero_expression_cells, set_full_reproducibility
+from interscale.tl import set_full_reproducibility
 from interscale.tl.utils import get_model_filename_prefix
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
@@ -157,19 +154,9 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
     set_full_reproducibility(cfg.optim.seed)
 
     ####### PREPROCESSING #######
-    # Load adata
-    adata = sc.read_h5ad(cfg.dataset.h5ad_data)
-    print_memory_usage("After loading h5ad")
-    adata = remove_zero_expression_cells(adata)
-    print(adata)
-    if cfg.dataset.segmentation_robustness is not None:
-        print("Applying segmentation noise...")
-        sq.gr.spatial_neighbors(adata, **cfg.dataset.spatial_neigbors_kwargs)
-        adata = apply_segmentation_noise(adata, cfg.dataset.segmentation_robustness)
-
-    print_memory_usage("Before build_graph_datasets")
-    datasets = build_graph_datasets(adata, cfg)
-    print_memory_usage("After build_graph_datasets")
+    print_memory_usage("Before load_graph_datasets")
+    datasets = load_graph_datasets(cfg)
+    print_memory_usage("After load_graph_datasets")
 
     # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
     # straight after the seeding above, whatever RNG the graph construction consumed.
@@ -222,7 +209,7 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         # collection, not in attention, and nothing in the message said so.
         trial_error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
     finally:
-        del model, dm, datasets, adata
+        del model, dm, datasets
         gc.collect()
         try:
             import torch

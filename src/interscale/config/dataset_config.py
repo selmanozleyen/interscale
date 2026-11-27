@@ -24,6 +24,10 @@ def get_dataset_cfg(cfg):
     cfg.dataset.layer_key = None  # default: .X
     cfg.dataset.sample_key = []
     cfg.dataset.split_key = "split"
+    # Directory for on-disk graph stores (interscale.data.write_graph_store). None keeps the graphs
+    # in memory. When set, the graphs are written once to <dir>/<name>-<fingerprint>.zarr and every
+    # later run with the same graph-building config trains from that store without reading h5ad_data.
+    cfg.dataset.graph_store = None
 
     cfg.dataset.batch_size = 32
     cfg.dataset.train_size = 0.7

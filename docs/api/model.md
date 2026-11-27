@@ -41,7 +41,23 @@ Models are built from, and trained on, :class:`torch_geometric.data.Dataset` sub
     data.InMemoryGraphDataset
     data.MaskedGraphDataset
     data.build_graph_datasets
+    data.ZarrGraphDataset
+    data.write_graph_store
+    data.open_graph_store
+    data.load_graph_datasets
 ```
+
+For data that does not fit in memory, write the graphs once to a zarr store and train from it; each training step then reads only the graphs in its batch:
+
+```
+from interscale.data import open_graph_store, write_graph_store
+
+write_graph_store(adata, cfg, "graphs.zarr")  # adata may be backed: ad.read_h5ad(path, backed="r")
+datasets = open_graph_store("graphs.zarr", cfg)  # same contract as build_graph_datasets
+model = interscale.model.CombinedModel(datasets[0], cfg=cfg)
+```
+
+From the command line, set `dataset.graph_store` to a directory: the first run writes the store for its config there, and later runs with the same graph-building settings train from it without reading `h5ad_data`.
 
 ### InterScale module
 

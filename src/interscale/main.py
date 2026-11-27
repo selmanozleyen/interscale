@@ -2,16 +2,12 @@ import argparse
 import warnings
 from pathlib import Path
 
-import scanpy as sc
-import squidpy as sq
-
 import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
-from interscale.data import build_graph_datasets
+from interscale.data import load_graph_datasets
 from interscale.geome_dataloader import GraphAnnDataModule
-from interscale.pp import apply_segmentation_noise
-from interscale.tl import remove_zero_expression_cells, set_full_reproducibility
+from interscale.tl import set_full_reproducibility
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
 # FutureWarnings so they don't flood the training logs.
@@ -36,20 +32,7 @@ def main(cfg, model_type):
 
     set_full_reproducibility(cfg.optim.seed)
     print(cfg)
-    adata = sc.read_h5ad(cfg.dataset.h5ad_data)
-    adata = remove_zero_expression_cells(adata)
-    print(adata)
-
-    if cfg.dataset.segmentation_robustness is not None:
-        node_fraction = cfg.dataset.segmentation_robustness[0]
-        overflow_fraction = cfg.dataset.segmentation_robustness[1]
-        print("\nApplying segmentation noise:")
-        print(f"- Node fraction: {node_fraction}")
-        print(f"- Overflow fraction: {overflow_fraction}")
-        sq.gr.spatial_neighbors(adata, **cfg.dataset.spatial_neigbors_kwargs)
-        adata = apply_segmentation_noise(adata, node_fraction, overflow_fraction)
-
-    datasets = build_graph_datasets(adata, cfg)
+    datasets = load_graph_datasets(cfg)
     # Re-seed so the initial weights depend only on optim.seed, exactly as when the model was built
     # straight after the seeding above, whatever RNG the graph construction consumed.
     set_full_reproducibility(cfg.optim.seed)
