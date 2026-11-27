@@ -7,6 +7,7 @@ from functools import partial
 from typing import Literal
 
 import lightning.pytorch as pl
+import torch
 from torch_geometric.loader import DataLoader
 from yacs.config import CfgNode as CN
 
@@ -123,7 +124,15 @@ class GraphAnnDataModule(pl.LightningDataModule):
         self.train_masked.epoch = int(epoch)
 
     def _loader(self, dataset: MaskedGraphDataset, shuffle: bool) -> DataLoader | _Prefetch:
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, num_workers=self.num_workers)
+        # Pinned batches copy to the GPU faster and asynchronously (Lightning moves them with
+        # non_blocking=True); with num_workers=0 the pinning runs on the _Prefetch thread too.
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
         return loader if self.num_workers else _Prefetch(loader)
 
     def train_dataloader(self) -> DataLoader | _Prefetch:
