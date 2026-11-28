@@ -15,7 +15,8 @@ from anndata import AnnData
 from torch_geometric.data import Data
 from torch_geometric.data import Dataset as PygDataset
 
-from interscale.geome.io import CONNECTIVITIES, GroupedAnnData
+from interscale.geome._refs import Field, to_path
+from interscale.geome.io import CONNECTIVITIES, GroupedAnnData, _column
 
 
 class GroupDataset(PygDataset):
@@ -33,11 +34,13 @@ class GroupDataset(PygDataset):
         :class:`~interscale.geome.io.GroupedAnnData`, or an AnnData object read from one (in memory,
         backed or lazy).
     x
-        Node features: ``"X"`` or ``"layers/<name>"``.
+        Node features: ``A.X`` / ``A.layers["<name>"]``, or the same as a ``.`` string (``"layers.<name>"``) or
+        ``/`` path (``"layers/<name>"``); see :mod:`interscale.geome._refs`.
     y
-        Optional categorical ``obs`` column, one-hot encoded over all of its categories.
+        Optional categorical ``obs`` column (``A.obs["<col>"]``, ``"obs.<col>"``, ``"obs/<col>"`` or the bare
+        name), one-hot encoded over all of its categories.
     extra
-        ``{attribute: "obsm/<name>" | "layers/<name>"}`` further per-cell arrays.
+        ``{attribute: field}`` further per-cell arrays, e.g. ``{"emb": A.obsm["latent"]}``.
     split
         Keep only the groups of this split (``uns["geome"]["group_split"]``); None keeps all.
     """
@@ -46,21 +49,23 @@ class GroupDataset(PygDataset):
         self,
         source: GroupedAnnData | AnnData | str | os.PathLike,
         *,
-        x: str = "X",
-        y: str | None = None,
-        extra: Mapping[str, str] | None = None,
+        x: Field = "X",
+        y: Field | None = None,
+        extra: Mapping[str, Field] | None = None,
         split: str | None = None,
     ):
         super().__init__(root=None)
         self.reader = source if isinstance(source, GroupedAnnData) else GroupedAnnData(source)
-        self.x_key, self.y_key, self.extra = x, y, dict(extra or {})
+        self.x_key = to_path(x)
+        self.y_key = None if y is None else _column(y)
+        self.extra = {attr: to_path(field) for attr, field in (extra or {}).items()}
         groups = self.reader.groups
         self.group_ids = np.flatnonzero(groups["split"].to_numpy() == split) if split else np.arange(len(groups))
         self.var_names = self.reader.var_names
         self.categories = None
         self._codes = None
         if y is not None:
-            column = self.reader.obs[y].astype("category")
+            column = self.reader.obs[self.y_key].astype("category")
             self.categories = [str(c) for c in column.cat.categories]
             self._codes = column.cat.codes.to_numpy()
         self._rows = self.reader.obs["source_row"].to_numpy()

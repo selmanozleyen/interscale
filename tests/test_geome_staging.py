@@ -6,6 +6,7 @@ import pytest
 import scipy.sparse as sp
 import torch
 import zarr
+from anndata.acc import A
 from anndata.experimental import read_lazy as anndata_read_lazy
 
 from interscale.data import ZarrGraphDataset, write_graph_store
@@ -122,3 +123,44 @@ def test_read_lazy_holds_the_small_parts_in_memory_and_reads_matrices_from_the_s
     assert all(hasattr(m, "compute") for m in (adata.X, adata.obsp["spatial_connectivities"])), "matrices stay lazy"
     reader = GroupedAnnData(adata)
     assert reader.adata is None and reader.group is not None, "matrices are read from the store, not through dask"
+
+
+@pytest.mark.parametrize(
+    ("spellings", "path"),
+    [
+        ((A.X, "X"), "X"),
+        ((A.layers["log1p"], "layers.log1p", "layers/log1p"), "layers/log1p"),
+        ((A.obsm["latent"], "obsm.latent", "obsm/latent"), "obsm/latent"),
+        ((A.obsp["spatial_connectivities"], "obsp.spatial_connectivities"), "obsp/spatial_connectivities"),
+        ((A.obs["ct"], "obs.ct", "obs/ct"), "obs/ct"),
+    ],
+)
+def test_accessors_dotted_strings_and_paths_name_the_same_field(spellings, path):
+    from interscale.geome._refs import as_acc, to_dotted, to_path
+
+    for field in spellings:
+        assert to_path(field) == path
+        assert as_acc(field) == as_acc(path)
+        assert as_acc(to_dotted(field)) == as_acc(field)
+
+
+def test_every_spelling_gives_the_same_graphs(make_cfg, make_spatial_adata, tmp_path):
+    cfg = make_cfg()
+    by_accessor = write_grouped(
+        make_spatial_adata(sparse=True), tmp_path / "a.zarr", groupby=A.obs["sample"], split="obs.split",
+        neighbors=_neighbors(cfg), matrices=[A.layers["log1p"]], obs=[A.obs["ct"]], obsm=[A.obsm["latent"]],
+    )  # fmt: skip
+    by_path = write_grouped(
+        make_spatial_adata(sparse=True), tmp_path / "p.zarr", groupby="obs/sample", split="split",
+        neighbors=_neighbors(cfg), matrices=["layers/log1p"], obs=["ct"], obsm=["obsm/latent"],
+    )  # fmt: skip
+    datasets = [
+        GroupDataset(by_accessor, x=A.layers["log1p"], y=A.obs["ct"], extra={"emb": A.obsm["latent"]}),
+        GroupDataset(by_path, x="layers/log1p", y="ct", extra={"emb": "obsm/latent"}),
+        GroupDataset(read_lazy(by_path), x="layers.log1p", y="obs.ct", extra={"emb": "obsm.latent"}),
+    ]
+    reference = datasets[0].__getitems__(range(len(datasets[0])))
+    for dataset in datasets[1:]:
+        for a, b in zip(reference, dataset.__getitems__(range(len(dataset))), strict=True):
+            for key in ("x", "edge_index", "y", "source_row", "emb"):
+                assert torch.equal(a[key], b[key]), key

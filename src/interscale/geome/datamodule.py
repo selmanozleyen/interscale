@@ -17,6 +17,7 @@ from anndata import AnnData
 from torch.utils.data import Dataset as TorchDataset
 from torch_geometric.loader import DataLoader
 
+from interscale.geome._refs import Field
 from interscale.geome.data import GroupDataset
 from interscale.geome.io import SPLITS, GroupedAnnData
 
@@ -124,9 +125,9 @@ class GroupDataModule(pl.LightningDataModule):
         self,
         source: GroupedAnnData | AnnData | str | os.PathLike,
         *,
-        x: str = "X",
-        y: str | None = None,
-        extra: Mapping[str, str] | None = None,
+        x: Field = "X",
+        y: Field | None = None,
+        extra: Mapping[str, Field] | None = None,
         batch_size: int = 1,
         transform: Callable | None = None,
         prefetch: int = 2,

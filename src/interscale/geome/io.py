@@ -34,6 +34,7 @@ from anndata.io import read_elem, sparse_dataset, write_elem
 from torch_geometric.utils import from_scipy_sparse_matrix
 from zarr.core.sync import sync
 
+from interscale.geome._refs import Field, as_acc, to_path
 from interscale.geome._zarr import Appender, gather, read_runs, runs
 
 FORMAT_VERSION = 1
@@ -42,16 +43,6 @@ CONNECTIVITIES = "spatial_connectivities"
 
 
 # ---------------------------------------------------------------------------------- source
-
-
-def _resolve(key: str) -> tuple[str, str | None]:
-    """``"X"`` -> ("X", None); ``"layers/name"`` / ``"obsm/name"`` -> (slot, name)."""
-    if key == "X":
-        return "X", None
-    slot, _, name = key.partition("/")
-    if slot not in ("layers", "obsm", "obsp") or not name:
-        raise ValueError(f"expected 'X', 'layers/<name>', 'obsm/<name>' or 'obsp/<name>', got {key!r}")
-    return slot, name
 
 
 class _Source:
@@ -67,11 +58,10 @@ class _Source:
             self.group = zarr.open_group(path, mode="r") if path.endswith(".zarr") else h5py.File(path, "r")
             self.obs, self.var = read_elem(self.group["obs"]), read_elem(self.group["var"])
 
-    def element(self, key: str):
-        slot, name = _resolve(key)
+    def element(self, field: Field):
         if self.adata is not None:
-            return self.adata.X if slot == "X" else getattr(self.adata, slot)[name]
-        elem = self.group[key]
+            return as_acc(field).get(self.adata)
+        elem = self.group[to_path(field)]
         return sparse_dataset(elem) if elem.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix") else elem
 
     @staticmethod
@@ -96,6 +86,16 @@ class _Source:
         """Rows whose ``X`` sums to non-zero, read ``chunk`` rows at a time."""
         x, n = self.element("X"), len(self.obs)
         return np.concatenate([np.asarray(x[a : a + chunk].sum(axis=1)).ravel() != 0 for a in range(0, n, chunk)])
+
+
+def _column(field: Field) -> str:
+    """An ``obs`` column name from a plain name, ``A.obs["c"]``, ``"obs.c"`` or ``"obs/c"``."""
+    if isinstance(field, str) and "." not in field and "/" not in field:
+        return field
+    path = to_path(field)
+    if not path.startswith("obs/"):
+        raise ValueError(f"expected an obs column, got {field!r}")
+    return path.split("/", 1)[1]
 
 
 def _groups(obs: pd.DataFrame, groupby: str, split: str | None, keep: np.ndarray):
@@ -212,6 +212,7 @@ def write_grouped(
         if row_filter is None
         else np.asarray(row_filter, bool)
     )
+    groupby, split = _column(groupby), (_column(split) if split else None)
     groups = list(_groups(src.obs, groupby, split, keep))
     order = np.concatenate([rows for *_, rows in groups])
     n = len(order)
@@ -221,7 +222,7 @@ def write_grouped(
     try:
         root = zarr.open_group(tmp, mode="w")
         root.attrs.update({"encoding-type": "anndata", "encoding-version": "0.1.0"})
-        columns = list(dict.fromkeys([groupby, *([split] if split else []), *obs]))
+        columns = list(dict.fromkeys([_column(groupby), *([_column(split)] if split else []), *map(_column, obs)]))
         obs_out = src.obs.iloc[order][columns].copy()
         obs_out["source_row"] = order
         write_elem(root, "obs", obs_out)
@@ -231,18 +232,21 @@ def write_grouped(
 
         writers = {}
         for key in matrices:
-            slot, name = _resolve(key)
-            elem = src.element(key)
-            parent, leaf = (root, "X") if slot == "X" else (root[slot], name)
+            path = to_path(key)
+            if not (path == "X" or path.startswith("layers/")):
+                raise ValueError(f"matrices takes X and layers, got {key!r}")
+            elem = src.element(path)
+            parent, leaf = (root, "X") if path == "X" else (root["layers"], path.split("/", 1)[1])
             if src.is_sparse(elem):
-                writers[key] = ("csr", elem, _CSRWriter(parent, leaf, (n, elem.shape[1]), elem.dtype, chunk_rows * 64))
+                writers[path] = ("csr", elem, _CSRWriter(parent, leaf, (n, elem.shape[1]), elem.dtype, chunk_rows * 64))
             else:
-                writers[key] = (
+                writers[path] = (
                     "dense",
                     elem,
                     _dense_writer(parent, leaf, n, elem.shape[1], elem.dtype, chunk_rows, shard_rows),
                 )
-        dense_obsm = {"spatial": coords, **{k: src.element(f"obsm/{k}") for k in obsm}}
+        keys = [to_path(k if "/" in str(k) or "." in str(k) or not isinstance(k, str) else f"obsm/{k}") for k in obsm]
+        dense_obsm = {"spatial": coords, **{p.split("/", 1)[1]: src.element(p) for p in keys}}
         obsm_writers = {
             k: (v, _dense_writer(root["obsm"], k, n, v.shape[1], v.dtype, chunk_rows, shard_rows))
             for k, v in dense_obsm.items()
@@ -423,11 +427,10 @@ class GroupedAnnData:
         return out
 
     def _slice(self, key: str, a: int, b: int):
-        slot, name = _resolve(key)
-        elem = self.adata.X if slot == "X" else getattr(self.adata, slot)[name]
+        elem = as_acc(key).get(self.adata)
         block = elem[a:b]
         block = block.compute() if hasattr(block, "compute") else block  # lazy (dask)
-        if slot == "obsp":  # block-diagonal: shift columns to group-local ids, keeping the edge order
+        if key.startswith("obsp/"):  # block-diagonal: shift columns to group-local ids, keeping the edge order
             m = sp.csr_matrix(block)
             return self._edges(sp.csr_matrix((m.data, m.indices - a, m.indptr), shape=(b - a, b - a)))
         return block.tocsr() if sp.issparse(block) else np.asarray(block)

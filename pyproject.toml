@@ -27,7 +27,7 @@ classifiers = [
 ]
 dynamic = [ "version" ]
 dependencies = [
-  "anndata",
+  "anndata>=0.13",                          # anndata.acc accessors (interscale.geome)
   "fast-array-utils[accel]",
   "geome",
   "lightning>=2",
@@ -128,7 +128,7 @@ sources.squidpy = { git = "https://github.com/scverse/squidpy", branch = "main" 
 [[tool.uv.dependency-metadata]]
 name = "geome"
 requires-dist = [
-  "anndata",
+  "anndata>=0.13",                          # anndata.acc accessors (interscale.geome)
   "numpy",
   "pandas",
   "pytorch-lightning",
