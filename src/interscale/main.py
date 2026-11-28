@@ -15,16 +15,16 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=r".*spatial_ne
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*n_neighs.*")
 
 
-def build_run(cfg, model_type: str, num_workers: int = 0):
+def build_run(cfg, model_type: str):
     """The model and datamodule of a training run: what ``main`` and ``main_sweep`` train."""
     set_full_reproducibility(cfg.optim.seed)  # graph construction may draw (segmentation noise)
     datasets = load_graph_datasets(cfg)
     set_full_reproducibility(cfg.optim.seed)  # so the initial weights depend only on optim.seed
     model = MODEL_CLASSES[model_type](datasets[0], cfg=cfg)
-    return model, GraphAnnDataModule.from_cfg(datasets, cfg, num_workers=num_workers)
+    return model, GraphAnnDataModule.from_cfg(datasets, cfg)
 
 
-def main(cfg, model_type, num_workers: int = 0):
+def main(cfg, model_type):
     """Train a single model.
 
     Parameters
@@ -33,9 +33,6 @@ def main(cfg, model_type, num_workers: int = 0):
         An already-resolved config, or a path to a single config file to load.
     model_type : str
         One of ``LocalModel``, ``GlobalModel``, ``CombinedModel``.
-    num_workers : int
-        DataLoader worker processes. Raise it when training from a graph store
-        (``dataset.graph_store``), where each worker reads its graphs from disk.
     """
     # Accepts a path as well as a cfg so the historical main(cfg_path, model_type) call still
     # works; the CLI now resolves the config itself, since --dataset/--task layers several files.
@@ -43,7 +40,7 @@ def main(cfg, model_type, num_workers: int = 0):
         cfg = load_config(cfg)
 
     print(cfg)
-    model, dm = build_run(cfg, model_type, num_workers=num_workers)
+    model, dm = build_run(cfg, model_type)
     model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=cfg.optim.early_stopping)
 
 
@@ -69,17 +66,9 @@ if __name__ == "__main__":
         help="The model type: LocalModel, GlobalModel or CombinedModel.",
     )
     parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=0,
-        help="DataLoader worker processes (default 0: batches load on a prefetch thread, which measured faster "
-        "than worker processes because those are re-forked every epoch).",
-    )
-    parser.add_argument(
         "--zarrs",
         action="store_true",
-        help="Read graph stores through the zarrs codec pipeline (pip install zarrs). Needs --num_workers 0: "
-        "zarrs deadlocks in forked DataLoader workers (zarrs-python#171).",
+        help="Read graph stores through the zarrs codec pipeline (pip install zarrs).",
     )
     args = parser.parse_args()
 
@@ -92,8 +81,6 @@ if __name__ == "__main__":
         parser.error("--model_type is required (LocalModel, GlobalModel or CombinedModel).")
 
     if args.zarrs:
-        if args.num_workers:
-            parser.error("--zarrs needs --num_workers 0 (zarrs deadlocks in forked workers, zarrs-python#171).")
         import zarr
         import zarrs  # noqa: F401
 
@@ -105,4 +92,4 @@ if __name__ == "__main__":
                 "codec_pipeline.file_handle_cache_size": 32,
             }
         )
-    main(resolve_cfg_from_args(args, parser=parser), args.model_type, num_workers=args.num_workers)
+    main(resolve_cfg_from_args(args, parser=parser), args.model_type)
