@@ -6,6 +6,14 @@ here depends on InterScale's config, models or masking.
 
 from .data import GroupDataset
 from .datamodule import EpochCallback, GroupDataModule, item_generator
-from .io import GroupedAnnData, write_grouped
+from .io import GroupedAnnData, read_lazy, write_grouped
 
-__all__ = ["EpochCallback", "GroupDataModule", "GroupDataset", "GroupedAnnData", "item_generator", "write_grouped"]
+__all__ = [
+    "EpochCallback",
+    "GroupDataModule",
+    "GroupDataset",
+    "GroupedAnnData",
+    "item_generator",
+    "read_lazy",
+    "write_grouped",
+]

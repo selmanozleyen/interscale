@@ -302,35 +302,68 @@ class _ZarrCSR:
         return [(int(self.indptr[a]), int(self.indptr[b])) for a, b in spans]
 
 
+def read_lazy(path: str | os.PathLike) -> AnnData:
+    """Open a grouped ``.zarr`` AnnData with the small parts in memory and the matrices lazy.
+
+    ``obs``, ``var``, ``uns`` and ``obsm`` are read into memory -- pandas, dicts and numpy, as
+    ``ad.read_zarr`` gives them. ``X``, ``layers`` and ``obsp`` are lazy dask arrays
+    (:func:`anndata.experimental.read_lazy`), so opening costs memory for the small parts only.
+    The object remembers its store (``uns["geome"]["store"]``, in memory only), and
+    :class:`GroupedAnnData` / :class:`~interscale.geome.data.GroupDataset` read its matrices from the
+    zarr arrays directly -- as fast as passing the path -- rather than through dask.
+    """
+    from anndata.experimental import read_lazy as anndata_read_lazy
+
+    group = zarr.open_group(path, mode="r")
+    lazy = anndata_read_lazy(group)
+    uns = read_elem(group["uns"])
+    uns["geome"]["store"] = str(Path(path).resolve())
+    return AnnData(
+        X=lazy.X,
+        obs=read_elem(group["obs"]),
+        var=read_elem(group["var"]),
+        uns=uns,
+        obsm={key: read_elem(group["obsm"][key]) for key in group["obsm"]},
+        layers={key: lazy.layers[key] for key in lazy.layers},
+        obsp={key: lazy.obsp[key] for key in lazy.obsp},
+    )
+
+
 class GroupedAnnData:
     """Row-range reads from an AnnData written by :func:`write_grouped`.
 
     Parameters
     ----------
     source
-        A ``.zarr`` path (batched reads through zarr directly), or an AnnData object -- in memory, backed
-        or lazy -- which is sliced.
+        A ``.zarr`` path or an AnnData from :func:`read_lazy`: matrices are read from the zarr arrays
+        directly, each array once per batch. Any other AnnData object -- in memory, backed (``.h5ad``,
+        where anndata keeps only ``X`` on disk) or from anndata's own ``read_lazy`` (slow: every
+        slice goes through dask) -- is sliced.
     """
 
     def __init__(self, source: AnnData | str | os.PathLike):
-        self.adata = source if isinstance(source, AnnData) else None
-        if self.adata is None:
-            self.path = Path(source)
-            if self.path.suffix != ".zarr":  # an .h5ad: slice a backed AnnData
-                import anndata as ad
-
-                self.adata = ad.read_h5ad(self.path, backed="r")
-        if self.adata is not None:
-            obs = self.adata.obs
+        self.adata = self.group = None
+        if isinstance(source, AnnData):
+            obs = source.obs
             self.obs = obs.to_memory() if hasattr(obs, "to_memory") else obs
-            self.var_names = list(map(str, self.adata.var_names))
-            # read_lazy keeps even uns arrays lazy (dask): materialise the small metadata
-            meta = {k: v.compute() if hasattr(v, "compute") else v for k, v in self.adata.uns["geome"].items()}
-        else:
-            self.group = zarr.open_group(self.path, mode="r")
+            self.var_names = list(map(str, source.var_names))
+            # anndata's read_lazy keeps even uns arrays lazy (dask): materialise the small metadata
+            meta = {k: v.compute() if hasattr(v, "compute") else v for k, v in source.uns["geome"].items()}
+            if meta.get("store"):  # from read_lazy: read the matrices from the store itself
+                self.group = zarr.open_group(meta["store"], mode="r")
+            else:
+                self.adata = source
+        elif Path(source).suffix == ".zarr":
+            self.group = zarr.open_group(source, mode="r")
             self.obs = read_elem(self.group["obs"])
             self.var_names = list(map(str, read_elem(self.group["var"]).index))
             meta = read_elem(self.group["uns/geome"])
+        else:  # an .h5ad: slice a backed AnnData
+            import anndata as ad
+
+            self.adata = ad.read_h5ad(source, backed="r")
+            self.obs, self.var_names = self.adata.obs, list(map(str, self.adata.var_names))
+            meta = dict(self.adata.uns["geome"])
         if int(meta["format_version"]) != FORMAT_VERSION:
             raise ValueError(f"grouped AnnData format {meta['format_version']}, expected {FORMAT_VERSION}.")
         self.group_ptr = np.asarray(meta["group_ptr"], dtype=np.int64)

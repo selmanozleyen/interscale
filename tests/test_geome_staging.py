@@ -6,10 +6,11 @@ import pytest
 import scipy.sparse as sp
 import torch
 import zarr
-from anndata.experimental import read_lazy
+from anndata.experimental import read_lazy as anndata_read_lazy
 
 from interscale.data import ZarrGraphDataset, write_graph_store
-from interscale.geome import GroupDataModule, GroupDataset, item_generator, write_grouped
+from interscale.geome import GroupDataModule, GroupDataset, item_generator, read_lazy, write_grouped
+from interscale.geome.io import GroupedAnnData
 
 
 def _neighbors(cfg):
@@ -44,7 +45,8 @@ def test_any_anndata_object_gives_the_same_graphs(make_cfg, make_spatial_adata, 
     sources = {
         "path": path,
         "in memory": ad.read_zarr(path),
-        "lazy": read_lazy(zarr.open_group(path, mode="r")),
+        "anndata read_lazy": anndata_read_lazy(zarr.open_group(path, mode="r")),
+        "geome read_lazy": read_lazy(path),
         "backed h5ad": tmp_path / "g.h5ad",
     }
     graphs = {name: GroupDataset(s, y="ct").__getitems__(range(5)) for name, s in sources.items()}
@@ -103,3 +105,20 @@ def test_datamodule_passes_idx_epoch_and_split_to_the_transform(make_cfg, make_s
     assert ("train", 1) not in seen
     list(dm.train_dataloader())
     assert ("train", 1) in seen and {s for s, _ in seen} == {"train", "val"}
+
+
+def test_read_lazy_holds_the_small_parts_in_memory_and_reads_matrices_from_the_store(
+    make_cfg, make_spatial_adata, tmp_path
+):
+    path = _write(make_spatial_adata(sparse=True), make_cfg(), tmp_path / "g.zarr", obsm=("latent",))
+
+    adata = read_lazy(path)
+
+    assert type(adata.obs).__name__ == "DataFrame" and isinstance(
+        adata.obs["sample"].dtype, __import__("pandas").CategoricalDtype
+    )
+    assert isinstance(adata.obsm["spatial"], np.ndarray) and isinstance(adata.obsm["latent"], np.ndarray)
+    assert isinstance(adata.uns["geome"]["group_ptr"], np.ndarray)
+    assert all(hasattr(m, "compute") for m in (adata.X, adata.obsp["spatial_connectivities"])), "matrices stay lazy"
+    reader = GroupedAnnData(adata)
+    assert reader.adata is None and reader.group is not None, "matrices are read from the store, not through dask"
